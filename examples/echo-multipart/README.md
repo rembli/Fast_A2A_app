@@ -5,9 +5,10 @@ Demonstrates streaming multi-part responses — no LLM, no API key, no AI framew
 ```
 examples/echo-multipart/
 ├── agent.py          # Yields three separate Artifact objects from a single prompt
-├── main.py           # FastAPI app wired with build_stream_invoke
-└── requirements.txt
+└── main.py           # FastAPI app wired with build_stream_invoke
 ```
+
+Dependencies are managed by the parent project's `pyproject.toml` — a single `poetry install` at the repo root covers every example.
 
 ## What it does
 
@@ -64,12 +65,11 @@ The 300 ms pauses between artifacts make the sequential delivery visible in the 
 ## Running
 
 ```bash
-cd examples/echo-multipart
-pip install -e ../../
-pip install -r requirements.txt
+# One-time: install fast_a2a_app + every example's deps from the repo root
+poetry install
 
-docker run -d -p 6379:6379 redis:7-alpine
-uvicorn main:app --reload
+cd examples/echo-multipart
+poetry run uvicorn main:app --reload
 ```
 
-No `.env` needed. Open `http://localhost:8000/` and type anything — you will see all three message types appear one after another.
+No `.env` needed and no Redis required — the in-process `MemoryTaskStore` is used by default. Open `http://localhost:8000/` and type anything — you will see all three message types appear one after another.

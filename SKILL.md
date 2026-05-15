@@ -179,7 +179,7 @@ The four-file split exists so each module has one job: `main.py` = composition r
 ## Verification checklist
 
 **All agents:**
-- [ ] Deps include `fast_a2a_app`, `fastapi`, `uvicorn[standard]`, `python-dotenv`, the runtime, plus `pyyaml` for multi-turn.
+- [ ] Deps (in `pyproject.toml`) include `fast_a2a_app`, `fastapi`, `uvicorn[standard]`, `python-dotenv`, the runtime, plus `pyyaml` for multi-turn.
 - [ ] `load_dotenv()` runs before `from agent import …`.
 - [ ] `/a2a` mounted before `/`.
 - [ ] `AgentCard.supported_interfaces[0].url` ends with `/a2a/`; `streaming=True` ⇔ `stream_invoke` provided.
@@ -208,7 +208,7 @@ The four-file split exists so each module has one job: `main.py` = composition r
 my_agent/
 ├── main.py             # FastAPI app, AgentCard, mounts, /health, optional uploads
 ├── agent.py            # invoke / stream_invoke + tools (no FastAPI imports)
-├── requirements.txt
+├── pyproject.toml      # Poetry-managed deps (or any PEP 621 build system)
 └── .env.example
 ```
 
@@ -218,16 +218,18 @@ my_agent/
 ├── main.py             # FastAPI app, AgentCard, mounts, /health, optional uploads
 ├── agent.py            # invoke / stream_invoke + tools (no FastAPI imports)
 ├── workflow.py         # workflows (no FastAPI imports)
-├── config.py           
-├── requirements.txt
+├── config.py
+├── pyproject.toml      # Poetry-managed deps (or any PEP 621 build system)
 └── .env.example
 ```
 
 Boot:
 ```bash
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000   # open http://localhost:8000/
+poetry install
+poetry run uvicorn main:app --reload --port 8000   # open http://localhost:8000/
 ```
+
+(In-repo examples share the parent project's `pyproject.toml` — running `poetry install` at the repo root installs everything every example needs; then `cd examples/<name> && poetry run uvicorn main:app --reload`.)
 (For multi-process deployments add `docker run -d -p 6379:6379 redis:7-alpine` and pass `task_store=RedisTaskStore.from_url("redis://localhost:6379")` to `build_a2a_app`.)
 
 Decide simple vs. multi-turn from the user's prompt, produce the files end-to-end, and verify against the matching checklist.

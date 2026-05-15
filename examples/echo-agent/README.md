@@ -5,9 +5,10 @@ Minimal fast_a2a_app integration — pure Python, no LLM, no API key, no AI fram
 ```
 examples/echo-agent/
 ├── agent.py          # Two plain async functions, zero external imports
-├── main.py           # FastAPI app with fast_a2a_app wiring
-└── requirements.txt  # fast_a2a_app only
+└── main.py           # FastAPI app with fast_a2a_app wiring
 ```
+
+Dependencies are managed by the parent project's `pyproject.toml` — a single `poetry install` at the repo root covers every example.
 
 ## What it does
 
@@ -46,11 +47,11 @@ app.mount("/", a2a_ui)
 ## Running
 
 ```bash
-cd examples/echo-agent
-pip install -e ../../
-pip install -r requirements.txt
+# One-time: install fast_a2a_app + every example's deps from the repo root
+poetry install
 
-uvicorn main:app --reload
+cd examples/echo-agent
+poetry run uvicorn main:app --reload
 ```
 
 No `.env` needed — the echo agent requires no API key, and no `REDIS_URL` either. The in-process `MemoryTaskStore` is used by default; set `REDIS_URL` (in `examples/.env` or your shell) to opt into Redis for multi-process or cross-instance deployments.

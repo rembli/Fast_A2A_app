@@ -6,9 +6,10 @@ A pydantic-ai agent that generates and iterates on images with Azure OpenAI's `g
 examples/image-creator/
 ├── agent.py          # pydantic-ai agent + tools + slash commands
 ├── image_store.py    # Filesystem-backed image storage (independent module)
-├── main.py           # FastAPI wiring + /images endpoints
-└── requirements.txt
+└── main.py           # FastAPI wiring + /images endpoints
 ```
+
+Dependencies are managed by the parent project's `pyproject.toml` — a single `poetry install` at the repo root covers every example.
 
 ## What it shows
 
@@ -55,10 +56,8 @@ To enable a different image deployment, add an entry to the `MODELS` dict in `ag
 ## Running
 
 ```bash
-# 1. Install
-cd examples/image-creator
-pip install -e ../../
-pip install -r requirements.txt
+# 1. Install fast_a2a_app + every example's deps from the repo root
+poetry install
 
 # 2. Authenticate to Azure
 az login
@@ -69,11 +68,12 @@ az login
 # Optional — overrides the default 1024x1024 image output size
 export IMAGE_SIZE=1024x1024
 
-# 3. Start Redis
+# 3. Start Redis (optional — falls back to memory if REDIS_URL unset)
 docker run -d -p 6379:6379 redis:7-alpine
 
 # 4. Run
-uvicorn main:app --reload
+cd examples/image-creator
+poetry run uvicorn main:app --reload
 ```
 
 Open `http://localhost:8000/`. The UI greets you via `/hello`. Try:

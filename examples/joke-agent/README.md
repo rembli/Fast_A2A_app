@@ -5,9 +5,10 @@ Shows fast_a2a_app wired to plain Azure OpenAI chat completions — no agent fra
 ```
 examples/joke-agent/
 ├── agent.py          # run_joke_agent + stream_joke_agent (raw chat completions)
-├── main.py           # FastAPI app using build_invoke / build_stream_invoke
-└── requirements.txt
+└── main.py           # FastAPI app using build_invoke / build_stream_invoke
 ```
+
+Dependencies are managed by the parent project's `pyproject.toml` — a single `poetry install` at the repo root covers every example.
 
 ## What it does
 
@@ -67,15 +68,17 @@ Authentication uses `AzureCliCredential` — managed identity, CLI login, or env
 ## Running
 
 ```bash
+# One-time: install fast_a2a_app + every example's deps from the repo root
+poetry install
+
 # One-time: create your .env from the shared template
 cp examples/.env.example examples/.env
 # edit examples/.env — set AZURE_AI_BASE_URL and AZURE_AI_DEPLOYMENT_NAME
 
-cd examples/joke-agent
-pip install -e ../../
-pip install -r requirements.txt
+az login                                        # AzureCliCredential
 
-uvicorn main:app --reload
+cd examples/joke-agent
+poetry run uvicorn main:app --reload
 ```
 
 Open `http://localhost:8000/` and try:

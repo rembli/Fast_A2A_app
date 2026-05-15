@@ -119,6 +119,24 @@ Every example follows the same two-file layout: `agent.py` owns the `agent_card`
 
 The first three examples (Echo Agent, Echo Multipart, Joke Agent) run on the in-process `MemoryTaskStore` and need no external service. The remaining examples opt into Redis when `REDIS_URL` is set in the environment (and fall back to memory otherwise).
 
+### Running an example with Poetry
+
+The examples don't ship their own `requirements.txt` — they share the parent project's dependency set, which already includes everything they need (`openai`, `azure-identity`, `pydantic-ai`, `folium`, …). One install at the repo root is enough for all examples.
+
+```bash
+# From the repo root — one-time
+poetry install                                  # installs fast_a2a_app + all example deps
+
+# Optional shared config (Azure-backed examples only)
+cp examples/.env.example examples/.env          # then edit AZURE_AI_BASE_URL / AZURE_AI_DEPLOYMENT_NAME
+
+# Run any example from its own directory
+cd examples/joke-agent
+poetry run uvicorn main:app --reload
+```
+
+The Azure-backed examples (`joke-agent`, `image-creator`, `holiday-planner`) additionally need `az login` for the `AzureCliCredential` bearer token. See each example's README for its specific extras (Redis, `IMAGE_SIZE`, etc.).
+
 ---
 
 ## Documentation

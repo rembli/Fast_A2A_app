@@ -5,9 +5,10 @@ A complete domain-specific agent built on fast_a2a_app using pydantic-ai and Azu
 ```
 examples/holiday-planner/
 ├── agent.py          # pydantic-ai agent + tools + deps + invoke/stream_invoke + suggestion generator
-├── main.py           # FastAPI app, AgentCard, mounts
-└── requirements.txt
+└── main.py           # FastAPI app, AgentCard, mounts
 ```
+
+Dependencies are managed by the parent project's `pyproject.toml` — a single `poetry install` at the repo root covers every example.
 
 ## What it shows
 
@@ -45,17 +46,18 @@ Agent: → create_itinerary(destination="Athens", …) → day-by-day plan
 ## Running
 
 ```bash
+# One-time: install fast_a2a_app + every example's deps from the repo root
+poetry install
+
 # One-time: create your .env from the shared template
 cp examples/.env.example examples/.env
 # edit examples/.env — set AZURE_AI_BASE_URL and AZURE_AI_DEPLOYMENT_NAME
 
-cd examples/holiday-planner
-pip install -e ../../
-pip install -r requirements.txt
-
-docker run -d -p 6379:6379 redis:7-alpine
+docker run -d -p 6379:6379 redis:7-alpine    # optional — falls back to memory if REDIS_URL unset
 az login
-uvicorn main:app --reload
+
+cd examples/holiday-planner
+poetry run uvicorn main:app --reload
 ```
 
 Open `http://localhost:8000/` and ask:
