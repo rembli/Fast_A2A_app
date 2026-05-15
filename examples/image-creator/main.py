@@ -122,7 +122,7 @@ app.mount(
         invoke=build_invoke(invoke),
         stream_invoke=build_stream_invoke(stream_invoke),
         history_max_lines=4,
-        a2a_task_store=task_store,
+        task_store=task_store,
         debug=DEBUG,
     ),
 )

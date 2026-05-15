@@ -214,12 +214,12 @@ def format_history(
 class ContextAwareRequestContextBuilder(SimpleRequestContextBuilder):
     """RequestContextBuilder that enriches each request with full conversation history."""
 
-    def __init__(self, a2a_task_store: A2ATaskStore) -> None:
+    def __init__(self, task_store: A2ATaskStore) -> None:
         super().__init__(
             should_populate_referred_tasks=True,
-            task_store=a2a_task_store,
+            task_store=task_store,
         )
-        self._a2a_task_store = a2a_task_store
+        self._task_store = task_store
 
     async def build(
         self,
@@ -241,7 +241,7 @@ class ContextAwareRequestContextBuilder(SimpleRequestContextBuilder):
         if not effective_context_id:
             return request_context
 
-        context_tasks = await self._a2a_task_store.list_by_context(
+        context_tasks = await self._task_store.list_by_context(
             effective_context_id,
             exclude_task_id=request_context.task_id,
         )
@@ -275,7 +275,7 @@ class ConfigurableAgentExecutor(AgentExecutor):
         | None = None,
         on_task_start: Callable[[str], Awaitable[None]] | None = None,
         on_task_cancel: Callable[[str, str], Awaitable[None]] | None = None,
-        a2a_task_store: A2ATaskStore | None = None,
+        task_store: A2ATaskStore | None = None,
         debug: bool = False,
     ) -> None:
         self._invoke = invoke
@@ -283,7 +283,7 @@ class ConfigurableAgentExecutor(AgentExecutor):
         self._stream_invoke = stream_invoke
         self._on_task_start = on_task_start
         self._on_task_cancel = on_task_cancel
-        self._a2a_task_store = a2a_task_store
+        self._task_store = task_store
         self._debug = debug
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._task_contexts: dict[str, str | None] = {}
@@ -393,8 +393,8 @@ class ConfigurableAgentExecutor(AgentExecutor):
         self._running_tasks[task_id] = asyncio_task
 
         poll_task: asyncio.Task | None = None
-        if self._a2a_task_store and task_id:
-            store = self._a2a_task_store
+        if self._task_store and task_id:
+            store = self._task_store
 
             async def _poll_cancel_signal() -> None:
                 while not asyncio_task.done():
@@ -559,9 +559,9 @@ class ConfigurableAgentExecutor(AgentExecutor):
         running = self._running_tasks.get(task_id)
         if running and not running.done():
             running.cancel()
-        elif self._a2a_task_store and task_id:
+        elif self._task_store and task_id:
             with contextlib.suppress(Exception):
-                await self._a2a_task_store.signal_cancel(task_id)
+                await self._task_store.signal_cancel(task_id)
 
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(
@@ -724,7 +724,7 @@ def build_a2a_app(
     prompt_builder: Callable[[RequestContext], str] | None = None,
     on_task_start: Callable[[str], Awaitable[None]] | None = None,
     on_task_cancel: Callable[[str, str], Awaitable[None]] | None = None,
-    a2a_task_store: A2ATaskStore | None = None,
+    task_store: A2ATaskStore | None = None,
     debug: bool = False,
 ):
     """Assemble a Starlette ASGI app handling all A2A JSON-RPC methods.
@@ -793,7 +793,7 @@ def build_a2a_app(
     * ``context.current_task``     — the task being executed right now
     * ``context.message``          — the raw A2A ``Message`` object
 
-    Supply ``a2a_task_store`` to use a Redis / Mongo / Postgres backend
+    Supply ``task_store`` to use a Redis / Mongo / Postgres backend
     (or any custom :class:`A2ATaskStore` implementation). Omit it and the
     in-process :class:`MemoryTaskStore` is used — zero infrastructure,
     suitable for development and single-process deployments only.
@@ -804,14 +804,14 @@ def build_a2a_app(
         system_prompt=system_prompt,
         history_max_lines=history_max_lines,
     )
-    resolved_store: A2ATaskStore = a2a_task_store or MemoryTaskStore()
+    resolved_store: A2ATaskStore = task_store or MemoryTaskStore()
     executor = ConfigurableAgentExecutor(
         invoke=invoke,
         prompt_builder=resolved_prompt_builder,
         stream_invoke=stream_invoke,
         on_task_start=on_task_start,
         on_task_cancel=on_task_cancel,
-        a2a_task_store=resolved_store,
+        task_store=resolved_store,
         debug=debug,
     )
     request_handler = DefaultRequestHandler(

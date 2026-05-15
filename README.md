@@ -84,7 +84,7 @@ export AZURE_AI_DEPLOYMENT_NAME=gpt-4o
 uvicorn main:app --reload
 ```
 
-No Docker needed for local development — the default in-process `MemoryTaskStore` keeps task state in RAM. For multi-process / cross-instance deployments, pass `a2a_task_store=RedisTaskStore.from_url(REDIS_URL)` (or a `MongoTaskStore` / `PostgresTaskStore`) to `build_a2a_app`.
+No Docker needed for local development — the default in-process `MemoryTaskStore` keeps task state in RAM. For multi-process / cross-instance deployments, pass `task_store=RedisTaskStore.from_url(REDIS_URL)` (or a `MongoTaskStore` / `PostgresTaskStore`) to `build_a2a_app`.
 
 Open <http://localhost:8000/> — you're chatting.
 

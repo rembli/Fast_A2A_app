@@ -49,9 +49,9 @@ All server-side state — tasks, context indices, cancel signals — lives behin
 | MongoDB | `MongoTaskStore` | Production where Mongo is already the operational data store. TTL indexes do the housekeeping server-side. |
 | Postgres | `PostgresTaskStore` | Production where Postgres is already the operational data store. `expires_at` columns + read-time filtering. |
 
-The default matters: omitting `a2a_task_store` from `build_a2a_app` gives you `MemoryTaskStore`, which means a hello-world agent boots with `uvicorn main:app` — no `docker run redis` step in the README. The trade-off is explicit: memory tasks do not survive restarts and cannot be shared across worker processes, so every store logs an `INFO` line on initialization that names the backend, and `MemoryTaskStore` additionally warns about its single-process limitation. Production users see exactly which backend is live on the very first console line.
+The default matters: omitting `task_store` from `build_a2a_app` gives you `MemoryTaskStore`, which means a hello-world agent boots with `uvicorn main:app` — no `docker run redis` step in the README. The trade-off is explicit: memory tasks do not survive restarts and cannot be shared across worker processes, so every store logs an `INFO` line on initialization that names the backend, and `MemoryTaskStore` additionally warns about its single-process limitation. Production users see exactly which backend is live on the very first console line.
 
-Switching backends is one constructor call away (`a2a_task_store=RedisTaskStore.from_url(...)`, or the Mongo/Postgres equivalents). Custom backends — DynamoDB, FoundationDB, an in-house service — plug in the same way by implementing the `A2ATaskStore` Protocol. Task persistence *and* cancel signalling go through that one Protocol, so a custom backend implements `signal_cancel()` / `is_cancel_signalled()` however it likes.
+Switching backends is one constructor call away (`task_store=RedisTaskStore.from_url(...)`, or the Mongo/Postgres equivalents). Custom backends — DynamoDB, FoundationDB, an in-house service — plug in the same way by implementing the `A2ATaskStore` Protocol. Task persistence *and* cancel signalling go through that one Protocol, so a custom backend implements `signal_cancel()` / `is_cancel_signalled()` however it likes.
 
 ## Self-contained UI, no build step
 

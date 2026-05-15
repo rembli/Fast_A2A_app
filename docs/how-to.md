@@ -65,9 +65,9 @@ app.mount("/a2a", build_a2a_app(
     agent_card=agent_card,
     invoke=build_invoke(invoke),
     stream_invoke=build_stream_invoke(stream_invoke),
-    # Omitting a2a_task_store uses the in-process MemoryTaskStore — single-process only.
+    # Omitting task_store uses the in-process MemoryTaskStore — single-process only.
     # For multi-process / cross-instance cancel, pass:
-    #     a2a_task_store=RedisTaskStore.from_url(os.environ["REDIS_URL"])
+    #     task_store=RedisTaskStore.from_url(os.environ["REDIS_URL"])
     # (or MongoTaskStore.from_uri / PostgresTaskStore.from_dsn).
 ))
 app.mount("/", a2a_ui)
@@ -592,18 +592,18 @@ build_a2a_app(agent_card=card, stream_invoke=build_stream_invoke(my_fn))
 build_a2a_app(
     agent_card=card,
     stream_invoke=build_stream_invoke(my_fn),
-    a2a_task_store=RedisTaskStore.from_url("redis://localhost:6379"),
+    task_store=RedisTaskStore.from_url("redis://localhost:6379"),
 )
 
 # Mongo — production where Mongo is already deployed.
 store = await MongoTaskStore.from_uri("mongodb://localhost:27017")
 build_a2a_app(agent_card=card, stream_invoke=build_stream_invoke(my_fn),
-              a2a_task_store=store)
+              task_store=store)
 
 # Postgres — production where Postgres is already deployed.
 store = await PostgresTaskStore.from_dsn("postgresql://user:pw@localhost/fast_a2a")
 build_a2a_app(agent_card=card, stream_invoke=build_stream_invoke(my_fn),
-              a2a_task_store=store)
+              task_store=store)
 ```
 
 Every store logs an `INFO` line on initialization so the console makes it obvious which backend is running. `MemoryTaskStore` additionally warns about its single-process limitation — heed it if you scale beyond one process.
@@ -625,7 +625,7 @@ class MyDynamoTaskStore:
 build_a2a_app(
     agent_card=card,
     stream_invoke=build_stream_invoke(my_fn),
-    a2a_task_store=MyDynamoTaskStore(...),
+    task_store=MyDynamoTaskStore(...),
 )
 ```
 
@@ -689,7 +689,7 @@ task_store = await PostgresTaskStore.from_dsn(POSTGRES_URL)
 app.mount("/a2a", build_a2a_app(
     agent_card=card,
     stream_invoke=build_stream_invoke(stream_invoke),
-    a2a_task_store=task_store,
+    task_store=task_store,
 ))
 ```
 

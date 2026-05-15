@@ -3,7 +3,7 @@ memory.py — In-process A2A task store
 
 A dependency-free :class:`MemoryTaskStore` that keeps tasks, the
 context-id index, and cancel signals in Python dicts. The default when
-no ``a2a_task_store`` is passed to ``build_a2a_app``.
+no ``task_store`` is passed to ``build_a2a_app``.
 
 WHEN TO USE
 -----------

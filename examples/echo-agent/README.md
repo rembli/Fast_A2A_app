@@ -37,7 +37,7 @@ app.mount(
         invoke=build_invoke(invoke),
         stream_invoke=build_stream_invoke(stream_invoke),
         prompt_builder=lambda ctx: ctx.get_user_input(),
-        a2a_task_store=task_store,
+        task_store=task_store,
     ),
 )
 app.mount("/", a2a_ui)

@@ -60,7 +60,7 @@ app.mount("/a2a", build_a2a_app(
 app.mount("/", a2a_ui)
 ```
 
-Uses the in-process `MemoryTaskStore` (fast_a2a_app's default). For multi-process or cross-instance deployments, pass `a2a_task_store=RedisTaskStore.from_url(...)`.
+Uses the in-process `MemoryTaskStore` (fast_a2a_app's default). For multi-process or cross-instance deployments, pass `task_store=RedisTaskStore.from_url(...)`.
 
 Authentication uses `AzureCliCredential` — managed identity, CLI login, or environment credentials, whatever is available.
 

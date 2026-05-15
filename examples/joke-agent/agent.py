@@ -51,7 +51,7 @@ agent_card = AgentCard(
 # ── Azure OpenAI config ───────────────────────────────────────────────────────
 
 AZURE_AI_BASE_URL = os.environ.get("AZURE_AI_BASE_URL", "").strip().rstrip("/")
-AZURE_AI_DEPLOYMENT_NAME = os.environ.get("AZURE_AI_DEPLOYMENT_NAME", "").strip() or "gpt-4o"
+AZURE_AI_DEPLOYMENT_NAME = os.environ.get("AZURE_AI_DEPLOYMENT_NAME", "").strip() or "gpt-5.4-mini"
 
 _client = AsyncOpenAI(
     base_url=f"{AZURE_AI_BASE_URL}/openai/v1",

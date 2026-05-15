@@ -5,7 +5,7 @@ One module per backend:
 
 * :mod:`fast_a2a_app.server.task_stores.memory`   — in-process dict store,
   single-process only, the default when ``build_a2a_app`` is called
-  without an explicit ``a2a_task_store``. Needs no external service —
+  without an explicit ``task_store``. Needs no external service —
   ideal for development, tests, and demos that should boot without
   Docker.
 * :mod:`fast_a2a_app.server.task_stores.redis`    — Redis-backed store,
@@ -17,7 +17,7 @@ One module per backend:
   using ``asyncpg`` and ``expires_at`` columns.
 
 Every backend implements the :class:`A2ATaskStore` Protocol below; pass any
-instance to ``build_a2a_app(a2a_task_store=...)``.
+instance to ``build_a2a_app(task_store=...)``.
 """
 from __future__ import annotations
 

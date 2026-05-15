@@ -24,7 +24,7 @@ DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
 
 AZURE_AI_BASE_URL = os.environ.get("AZURE_AI_BASE_URL", "").strip().rstrip("/")
 AZURE_AI_DEPLOYMENT_NAME = (
-    os.environ.get("AZURE_AI_DEPLOYMENT_NAME", "").strip() or "gpt-4o"
+    os.environ.get("AZURE_AI_DEPLOYMENT_NAME", "").strip() or "gpt-5.4-mini"
 )
 
 # ── Image generation ──────────────────────────────────────────────────────────

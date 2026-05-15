@@ -25,7 +25,7 @@
   module per backend, replacing the single-file `task_store.py`:
   - `memory.py` — `MemoryTaskStore`, an in-process dict store that
     needs no external service. **The new default** when
-    `a2a_task_store` is omitted from `build_a2a_app`, so a
+    `task_store` is omitted from `build_a2a_app`, so a
     hello-world agent boots without Docker. Single-process only.
   - `redis.py` — `RedisTaskStore` (moved unchanged), now with a
     `RedisTaskStore.from_url(url)` classmethod for ergonomic
@@ -47,7 +47,7 @@
 
 - **`build_a2a_app` no longer accepts `redis_url` or `redis_client`.**
   Backends own their own connection setup; pass a fully-constructed
-  `a2a_task_store=` instead. The default when omitted is
+  `task_store=` instead. The default when omitted is
   `MemoryTaskStore()`.
 - Examples updated to the new pattern: `echo-agent`, `echo-multipart`,
   and `joke-agent` rely on the memory default and need no Docker;
@@ -89,7 +89,7 @@
 
 - `redis_url` and `redis_client` parameters on `build_a2a_app`.
   Migration: replace `redis_url=REDIS_URL` with
-  `a2a_task_store=RedisTaskStore.from_url(REDIS_URL)`.
+  `task_store=RedisTaskStore.from_url(REDIS_URL)`.
 
 ## 0.5.0 — 2026-05-11
 

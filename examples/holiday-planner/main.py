@@ -76,7 +76,7 @@ app.mount(
         # default builder's text-prefix injection so the model doesn't
         # see every prior turn twice.
         history_max_lines=0,
-        a2a_task_store=task_store,
+        task_store=task_store,
         debug=DEBUG,
     ),
 )

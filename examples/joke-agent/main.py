@@ -27,7 +27,7 @@ from fast_a2a_app import (  # noqa: E402
 from agent import agent_card, run_joke_agent, stream_joke_agent  # noqa: E402
 
 # Uses the in-process MemoryTaskStore (fast_a2a_app's default). Swap in
-# `a2a_task_store=RedisTaskStore.from_url(...)` for multi-process or
+# `task_store=RedisTaskStore.from_url(...)` for multi-process or
 # cross-instance deployments.
 DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
 

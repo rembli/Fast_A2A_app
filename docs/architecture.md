@@ -49,7 +49,7 @@ All server-side state — including cross-instance cancel signals — is owned b
 
 | Store | Module | Persistence | Cross-instance cancel | When to use |
 |---|---|---|---|---|
-| `MemoryTaskStore` | `task_stores/memory.py` | None (RAM, lost on restart) | No — single process only | Dev, tests, demos. The default when `a2a_task_store` is omitted. |
+| `MemoryTaskStore` | `task_stores/memory.py` | None (RAM, lost on restart) | No — single process only | Dev, tests, demos. The default when `task_store` is omitted. |
 | `RedisTaskStore` | `task_stores/redis.py` | Native TTL keys (24 h) | Yes — short-TTL key | Production. Universally available, supports horizontal scale out of the box. |
 | `MongoTaskStore` | `task_stores/mongo.py` | TTL indexes on `expires_at` | Yes — `cancel_signals` collection | Production where Mongo is already the operational store. |
 | `PostgresTaskStore` | `task_stores/postgres.py` | `expires_at` columns + read-time filter | Yes — `a2a_cancel_signals` table | Production where Postgres is already the operational store. |
@@ -69,9 +69,9 @@ docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pw postgres:16
 Then construct the store and hand it to `build_a2a_app`:
 
 ```python
-build_a2a_app(..., a2a_task_store=RedisTaskStore.from_url("redis://localhost:6379"))
-build_a2a_app(..., a2a_task_store=await MongoTaskStore.from_uri("mongodb://localhost:27017"))
-build_a2a_app(..., a2a_task_store=await PostgresTaskStore.from_dsn("postgresql://postgres:pw@localhost/postgres"))
+build_a2a_app(..., task_store=RedisTaskStore.from_url("redis://localhost:6379"))
+build_a2a_app(..., task_store=await MongoTaskStore.from_uri("mongodb://localhost:27017"))
+build_a2a_app(..., task_store=await PostgresTaskStore.from_dsn("postgresql://postgres:pw@localhost/postgres"))
 ```
 
 Task persistence *and* cancel signalling both go through the `A2ATaskStore` Protocol — a custom backend implements `signal_cancel()` / `is_cancel_signalled()` however it likes (e.g. a `cancellations` collection in Mongo).

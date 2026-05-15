@@ -41,7 +41,7 @@ Assembles a Starlette ASGI app implementing the A2A protocol. Mount it at any pa
 | `prompt_builder` | `Callable \| None` | auto | Custom `(RequestContext) -> str`; overrides `system_prompt` and `history_max_lines` (Level 2/3) |
 | `on_task_start` | `Callable[[str], Awaitable] \| None` | `None` | Called before each task — useful for metrics or per-task locks |
 | `on_task_cancel` | `Callable[[str, str], Awaitable] \| None` | `None` | Called on cancel with `(context_id, task_id)` |
-| `a2a_task_store` | `A2ATaskStore \| None` | `MemoryTaskStore()` | Task store implementing the `A2ATaskStore` Protocol. Omit for the in-process `MemoryTaskStore` (single-process only); pass `RedisTaskStore.from_url(...)` / `MongoTaskStore.from_uri(...)` / `PostgresTaskStore.from_dsn(...)` for multi-process deployments. |
+| `task_store` | `A2ATaskStore \| None` | `MemoryTaskStore()` | Task store implementing the `A2ATaskStore` Protocol. Omit for the in-process `MemoryTaskStore` (single-process only); pass `RedisTaskStore.from_url(...)` / `MongoTaskStore.from_uri(...)` / `PostgresTaskStore.from_dsn(...)` for multi-process deployments. |
 | `debug` | `bool` | `False` | Include exception details in failure messages and surface them in the UI |
 
 ---
@@ -290,11 +290,11 @@ class A2ATaskStore(Protocol):
     async def is_cancel_signalled(self, task_id): ...
 ```
 
-Implement this against any datastore and pass it to `build_a2a_app(a2a_task_store=...)`. Four built-in implementations ship in `fast_a2a_app.server.task_stores`:
+Implement this against any datastore and pass it to `build_a2a_app(task_store=...)`. Four built-in implementations ship in `fast_a2a_app.server.task_stores`:
 
 | Store | When to use | Constructor |
 |---|---|---|
-| `MemoryTaskStore` | Dev, tests, single-process demos. The default when `a2a_task_store` is omitted. State lives in RAM — no persistence, no cross-instance cancel. | `MemoryTaskStore()` |
+| `MemoryTaskStore` | Dev, tests, single-process demos. The default when `task_store` is omitted. State lives in RAM — no persistence, no cross-instance cancel. | `MemoryTaskStore()` |
 | `RedisTaskStore` | Production. Native TTL, horizontal scale, cross-instance cancel via short-TTL keys. | `RedisTaskStore(client)` or `RedisTaskStore.from_url("redis://…")` |
 | `MongoTaskStore` | Production where Mongo is the operational data store. TTL indexes drop expired docs server-side. | `MongoTaskStore(client, database_name="fast_a2a")` or `await MongoTaskStore.from_uri("mongodb://…")` |
 | `PostgresTaskStore` | Production where Postgres is the operational data store. `expires_at` columns + read-time filtering. | `PostgresTaskStore(pool)` or `await PostgresTaskStore.from_dsn("postgresql://…")` |
@@ -309,9 +309,9 @@ In-process dict store, no external service required.
 from fast_a2a_app import MemoryTaskStore, build_a2a_app
 
 # Explicit (same as the default)
-build_a2a_app(..., a2a_task_store=MemoryTaskStore())
+build_a2a_app(..., task_store=MemoryTaskStore())
 
-# Or simply omit a2a_task_store and the default is applied for you.
+# Or simply omit task_store and the default is applied for you.
 ```
 
 ### `RedisTaskStore`
@@ -329,7 +329,7 @@ from fast_a2a_app import RedisTaskStore, build_a2a_app
 
 build_a2a_app(
     ...,
-    a2a_task_store=RedisTaskStore.from_url("redis://localhost:6379"),
+    task_store=RedisTaskStore.from_url("redis://localhost:6379"),
 )
 ```
 
@@ -341,7 +341,7 @@ Async MongoDB-backed store using `motor` and TTL indexes (`tasks.expires_at` = 2
 from fast_a2a_app import MongoTaskStore, build_a2a_app
 
 store = await MongoTaskStore.from_uri("mongodb://localhost:27017")
-build_a2a_app(..., a2a_task_store=store)
+build_a2a_app(..., task_store=store)
 ```
 
 Collections live in the `fast_a2a` database by default — override via the `database_name=` argument.
@@ -356,7 +356,7 @@ from fast_a2a_app import PostgresTaskStore, build_a2a_app
 store = await PostgresTaskStore.from_dsn(
     "postgresql://user:pw@localhost/fast_a2a",
 )
-build_a2a_app(..., a2a_task_store=store)
+build_a2a_app(..., task_store=store)
 ```
 
 ---

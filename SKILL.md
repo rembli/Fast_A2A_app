@@ -29,7 +29,7 @@ Skip for: unrelated FastAPI work, plain LLM scripts with no chat surface, A2A *c
 1. **Two callable shapes.** Streaming: `async def fn(prompt: str) -> AsyncIterable[str | Artifact]`. Non-streaming: `async def fn(prompt: str) -> str | Artifact`. Either may take an optional second positional `RequestContext` — auto-detected via `inspect`.
 2. **Wrap before mounting.** `invoke=build_invoke(fn)` and/or `stream_invoke=build_stream_invoke(fn)`. The wrapper enables `report_progress()` and the `(prompt, context)` shape detection.
 3. **Mount `/a2a` before `/`.** The UI is a catch-all and will swallow protocol traffic if mounted first. In production, gate the UI on `DEBUG`.
-4. **Task store is pluggable, memory by default.** Omit `a2a_task_store` and an in-process `MemoryTaskStore` is used — zero infrastructure, single process only. For multi-process / cross-instance cancel, pass `a2a_task_store=RedisTaskStore.from_url(REDIS_URL)` (or `MongoTaskStore.from_uri(...)` / `PostgresTaskStore.from_dsn(...)`).
+4. **Task store is pluggable, memory by default.** Omit `task_store` and an in-process `MemoryTaskStore` is used — zero infrastructure, single process only. For multi-process / cross-instance cancel, pass `task_store=RedisTaskStore.from_url(REDIS_URL)` (or `MongoTaskStore.from_uri(...)` / `PostgresTaskStore.from_dsn(...)`).
 5. **Provide an `AgentCard`.** Required: `name`, `description`, `version`, `supported_interfaces=[AgentInterface(url=f"{APP_BASE_URL}/a2a/", protocol_binding="JSONRPC")]`, `capabilities`, `default_input_modes`, `default_output_modes`. Set `streaming=True` iff `stream_invoke` is provided. Add `skills=[AgentSkill(...)]` per capability.
 
 ---
@@ -64,7 +64,7 @@ from a2a.server.agent_execution import RequestContext   # only if fn takes conte
 | `prompt_builder`    | auto                     | Level 3 — full control (e.g. inject `[cid:UUID]`, RAG context)          |
 | `on_task_start`     | `None`                   | metrics, locks                                                          |
 | `on_task_cancel`    | `None`                   | cancel DBOS workflows, release locks (asyncio cancel is automatic)     |
-| `a2a_task_store`    | `MemoryTaskStore`        | pass `RedisTaskStore.from_url(...)` / `MongoTaskStore.from_uri(...)` / `PostgresTaskStore.from_dsn(...)` for multi-process |
+| `task_store`        | `MemoryTaskStore`        | pass `RedisTaskStore.from_url(...)` / `MongoTaskStore.from_uri(...)` / `PostgresTaskStore.from_dsn(...)` for multi-process |
 | `debug`             | `False`                  | dev only — surfaces tracebacks in UI failure messages                   |
 
 **Artifacts:** `text_artifact(text)` (markdown), `data_artifact(dict)` (table; declare `_type` *inside* the dict), `file_artifact(content=… or url=…, filename, media_type)`, `image_artifact(image_bytes=… or url=…, caption=…)`, `prompt_suggestions_artifact([{label, prompt}, …])` (clickable pills). Prefer URL form for non-trivial files — the UI's `localStorage` quota is ~5–10 MB.
@@ -116,7 +116,7 @@ agent_card = AgentCard(
 app.mount("/a2a", build_a2a_app(
     agent_card=agent_card,
     stream_invoke=build_stream_invoke(stream_invoke),
-    # a2a_task_store=RedisTaskStore.from_url(REDIS_URL),  # uncomment for multi-process
+    # task_store=RedisTaskStore.from_url(REDIS_URL),  # uncomment for multi-process
 ))
 app.mount("/", a2a_ui)
 ```
@@ -156,7 +156,7 @@ The four-file split exists so each module has one job: `main.py` = composition r
 
 ## Pitfalls
 
-1. Using the default `MemoryTaskStore` in a multi-worker deployment (uvicorn `--workers 2+`, gunicorn, or any horizontally-scaled setup). Tasks live in the worker that handled them — sibling workers see nothing, cross-instance cancel cannot work. Pass `a2a_task_store=RedisTaskStore.from_url(...)` (or Mongo / Postgres) for anything beyond a single process.
+1. Using the default `MemoryTaskStore` in a multi-worker deployment (uvicorn `--workers 2+`, gunicorn, or any horizontally-scaled setup). Tasks live in the worker that handled them — sibling workers see nothing, cross-instance cancel cannot work. Pass `task_store=RedisTaskStore.from_url(...)` (or Mongo / Postgres) for anything beyond a single process.
 2. Mounting `/` before `/a2a` — the UI catch-all swallows protocol traffic.
 3. Double history: leaving `history_max_lines=12` while *also* passing `message_history` to a pydantic-ai agent. Set it to `0` when feeding history yourself.
 4. Passing a bare function to `build_a2a_app`. Always wrap with `build_invoke` / `build_stream_invoke`.
@@ -183,7 +183,7 @@ The four-file split exists so each module has one job: `main.py` = composition r
 - [ ] `load_dotenv()` runs before `from agent import …`.
 - [ ] `/a2a` mounted before `/`.
 - [ ] `AgentCard.supported_interfaces[0].url` ends with `/a2a/`; `streaming=True` ⇔ `stream_invoke` provided.
-- [ ] `GET /health` exists. Multi-process deployments pass `a2a_task_store=RedisTaskStore.from_url(...)` (or Mongo / Postgres); single-process demos let the default `MemoryTaskStore` apply.
+- [ ] `GET /health` exists. Multi-process deployments pass `task_store=RedisTaskStore.from_url(...)` (or Mongo / Postgres); single-process demos let the default `MemoryTaskStore` apply.
 - [ ] If using a framework with its own message-history (pydantic-ai, etc.): `history_max_lines=0` AND a `_build_message_history(context)` adapter.
 - [ ] Every tool that does I/O calls `report_progress(...)` at least once (streaming only).
 - [ ] Boot test: server starts, `GET /a2a/.well-known/agent-card.json` returns the card, `/` loads the UI, hello message round-trips.
@@ -228,6 +228,6 @@ Boot:
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000   # open http://localhost:8000/
 ```
-(For multi-process deployments add `docker run -d -p 6379:6379 redis:7-alpine` and pass `a2a_task_store=RedisTaskStore.from_url("redis://localhost:6379")` to `build_a2a_app`.)
+(For multi-process deployments add `docker run -d -p 6379:6379 redis:7-alpine` and pass `task_store=RedisTaskStore.from_url("redis://localhost:6379")` to `build_a2a_app`.)
 
 Decide simple vs. multi-turn from the user's prompt, produce the files end-to-end, and verify against the matching checklist.

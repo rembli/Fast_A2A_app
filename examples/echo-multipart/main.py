@@ -10,10 +10,10 @@ Run with:
 Open http://localhost:8000/ — no API key required.
 
 Uses the in-process ``MemoryTaskStore`` (the default when no
-``a2a_task_store`` is passed), so the agent runs without any external
+``task_store`` is passed), so the agent runs without any external
 service. For multi-process / cross-instance deployments, instantiate
 ``RedisTaskStore.from_url(...)`` (or ``MongoTaskStore`` / ``PostgresTaskStore``)
-and pass it as ``a2a_task_store=``.
+and pass it as ``task_store=``.
 """
 from __future__ import annotations
 
