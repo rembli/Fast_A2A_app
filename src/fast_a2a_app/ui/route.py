@@ -22,8 +22,14 @@ in the served HTML so the bundled JS can branch on it.
 from __future__ import annotations
 
 import json
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Iterable
+
+try:
+    _LIBRARY_VERSION = _pkg_version("fast_a2a_app")
+except PackageNotFoundError:
+    _LIBRARY_VERSION = "dev"
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -115,6 +121,7 @@ def build_a2a_ui(
     config = {
         "fileUploadApi": file_upload_api,
         "acceptedFileTypes": _normalise_accepted_file_types(accepted_file_types),
+        "libraryVersion": _LIBRARY_VERSION,
     }
     config_js = f"window.UI_CONFIG = {json.dumps(config)};"
     # Snapshot the renderers directory **at build time** — dropping a

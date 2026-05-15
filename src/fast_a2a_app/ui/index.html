@@ -81,7 +81,7 @@
   </div>
 
   <!-- ── Input ── -->
-  <div id="composer" class="bg-white border-t px-5 py-4 shrink-0">
+  <div id="composer" class="bg-white border-t px-5 pt-4 pb-1 shrink-0">
     <div class="max-w-3xl mx-auto">
       <!-- Attachment preview strip (hidden until files are attached) -->
       <div id="attachments" class="hidden flex flex-wrap gap-2 mb-2"></div>
@@ -125,6 +125,10 @@
       </div>
     </div>
   </div>
+
+  <!-- ── Version footer ── -->
+  <footer id="version-footer"
+    class="bg-white shrink-0 text-center text-[10px] text-slate-400 py-1 select-none"></footer>
 
   <!-- ── Fullscreen image viewer / editor (hidden by default) ── -->
   <div id="fullscreen"
@@ -197,6 +201,11 @@
 <script>
 /* UI_CONFIG */
 /* DATA_TYPE_RENDERERS */
+(function () {
+  var el = document.getElementById('version-footer');
+  var v = (window.UI_CONFIG && window.UI_CONFIG.libraryVersion) || '';
+  if (el && v) el.textContent = 'fast_a2a_app v' + v;
+})();
 </script>
 <script src="app.js" defer></script>
 </body>
