@@ -1,0 +1,282 @@
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #e2e8f0;
+      border-top-color: #2563eb;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    .spinner-lg {
+      width: 44px;
+      height: 44px;
+      border-width: 4px;
+      border-color: rgba(255, 255, 255, 0.35);
+      border-top-color: #ffffff;
+    }
+
+    /* Markdown prose styles scoped to agent bubbles */
+
+    /* MAP artifact — Leaflet tile sharpness fix + invalidateSize trigger.
+       The ``z-index: 1`` keeps Leaflet's pane stack inside the bubble's
+       stacking context so tooltips don't bleed through the fullscreen
+       overlay or the wire-debug panel. */
+    .a2a-map-wrap .leaflet-container { z-index: 1; }
+    .markdown h1 { font-size:1.2rem; font-weight:700; margin:.75rem 0 .4rem; }
+    .markdown h2 { font-size:1.05rem; font-weight:700; margin:.65rem 0 .4rem; }
+    .markdown h3 { font-size:.95rem; font-weight:600; margin:.5rem 0 .3rem; }
+    .markdown h1:first-child,
+    .markdown h2:first-child,
+    .markdown h3:first-child { margin-top:0; }
+    .markdown p  { margin:.35rem 0; }
+    .markdown p:first-child { margin-top:0; }
+    .markdown p:last-child  { margin-bottom:0; }
+    .markdown ul { list-style:disc;    padding-left:1.25rem; margin:.35rem 0; }
+    .markdown ol { list-style:decimal; padding-left:1.25rem; margin:.35rem 0; }
+    .markdown li { margin:.15rem 0; }
+    .markdown li > ul,
+    .markdown li > ol { margin:.1rem 0; }
+    .markdown code {
+      background:#f1f5f9; border-radius:.25rem;
+      padding:.1rem .3rem; font-family:monospace;
+      font-size:.8em; color:#334155;
+    }
+    .markdown pre {
+      background:#f1f5f9; border:1px solid #e2e8f0;
+      border-radius:.5rem; padding:.75rem;
+      overflow-x:auto; margin:.5rem 0;
+    }
+    .markdown pre code {
+      background:none; padding:0; border-radius:0; font-size:.78rem;
+    }
+    .markdown blockquote {
+      border-left:3px solid #cbd5e1; padding-left:.75rem;
+      color:#64748b; margin:.5rem 0;
+    }
+    .markdown a { color:#2563eb; text-decoration:underline; }
+    .markdown a:hover { color:#1d4ed8; }
+    .markdown hr { border:none; border-top:1px solid #e2e8f0; margin:.5rem 0; }
+    .markdown strong { font-weight:600; }
+    .markdown em { font-style:italic; }
+    .markdown table { width:100%; border-collapse:collapse; font-size:.85rem; margin:.5rem 0; }
+    .markdown th {
+      background:#f8fafc; font-weight:600;
+      padding:.35rem .5rem; border:1px solid #e2e8f0; text-align:left;
+    }
+    .markdown td { padding:.35rem .5rem; border:1px solid #e2e8f0; }
+
+    /* Data part key-value table */
+    .kv-key  { color:#64748b; font-weight:500; padding-right:.875rem; white-space:nowrap; vertical-align:top; }
+    .kv-str  { color:#1d4ed8; }
+    .kv-num  { color:#7c3aed; font-variant-numeric:tabular-nums; }
+    .kv-bool { color:#0369a1; }
+    .kv-null { color:#94a3b8; font-style:italic; }
+    .kv-obj  { color:#334155; }
+
+    /* table_artifact (`TABLE`) — zebra-stripe colour follows the surface,
+       so the alt row reads as a subtle tint in both light and dark modes
+       instead of a high-contrast band that drowns the cell text. */
+    .table-zebra > tbody > tr:nth-child(even) { background-color: rgba(15, 23, 42, 0.03); }
+    .table-zebra > tbody > tr             { border-bottom: 1px solid #f1f5f9; }
+    .table-zebra > thead > tr             { border-bottom: 1px solid #e2e8f0; }
+
+    /* ── Dark mode ────────────────────────────────────────────────────────
+       Overrides the Tailwind utility classes used in this file when the
+       <html> element has class="dark". `.dark .x` (specificity 0,2,0) beats
+       Tailwind's single-class rules, so no `dark:` variants are needed. */
+    html.dark { color-scheme: dark; }
+    html.dark body { background-color: #0f172a; color: #e2e8f0; }
+
+    /* Surfaces */
+    html.dark .bg-white       { background-color: #1e293b; }
+    html.dark .bg-slate-50    { background-color: #1e293b; }
+    html.dark .bg-slate-100   { background-color: #0f172a; }
+    html.dark .bg-blue-50     { background-color: rgba(30, 58, 138, 0.25); }
+    html.dark .bg-blue-100    { background-color: rgba(30, 58, 138, 0.4); }
+    html.dark .bg-red-50      { background-color: rgba(127, 29, 29, 0.3); }
+
+    /* Text */
+    html.dark .text-slate-800 { color: #e2e8f0; }
+    html.dark .text-slate-700 { color: #cbd5e1; }
+    html.dark .text-slate-500 { color: #94a3b8; }
+    html.dark .text-slate-400 { color: #64748b; }
+    html.dark .text-blue-600  { color: #60a5fa; }
+    html.dark .text-blue-700  { color: #93c5fd; }
+    html.dark .text-blue-800  { color: #93c5fd; }
+    html.dark .text-red-700   { color: #fca5a5; }
+
+    /* Borders — bare width utilities first, explicit colors after so the
+       cascade resolves a specific color over the generic dark border. */
+    html.dark .border,
+    html.dark .border-t,
+    html.dark .border-b,
+    html.dark .border-l,
+    html.dark .border-r         { border-color: #334155; }
+    html.dark .border-slate-200 { border-color: #334155; }
+    html.dark .border-slate-300 { border-color: #475569; }
+    html.dark .border-blue-100  { border-color: rgba(30, 64, 175, 0.5); }
+    html.dark .border-blue-200  { border-color: rgba(30, 64, 175, 0.6); }
+    html.dark .border-blue-300  { border-color: rgba(37, 99, 235, 0.7); }
+
+    /* Form controls don't pick up body color/background by default */
+    html.dark input,
+    html.dark textarea,
+    html.dark select {
+      background-color: #1e293b;
+      color: #e2e8f0;
+    }
+    html.dark textarea::placeholder,
+    html.dark input::placeholder { color: #64748b; }
+    /* Fullscreen viewer textarea keeps its translucent dark styling */
+    html.dark #fs-input { background-color: rgba(255, 255, 255, 0.1); color: #fff; }
+
+    /* Markdown */
+    html.dark .markdown code  { background:#334155; color:#e2e8f0; }
+    html.dark .markdown pre   { background:#0f172a; border-color:#334155; }
+    html.dark .markdown blockquote { border-color:#475569; color:#94a3b8; }
+    html.dark .markdown a     { color:#60a5fa; }
+    html.dark .markdown a:hover { color:#93c5fd; }
+    html.dark .markdown hr    { border-color:#334155; }
+    html.dark .markdown th    { background:#1e293b; border-color:#334155; }
+    html.dark .markdown td    { border-color:#334155; }
+
+    /* Key-value table */
+    html.dark .kv-key  { color:#94a3b8; }
+    html.dark .kv-str  { color:#93c5fd; }
+    html.dark .kv-num  { color:#c4b5fd; }
+    html.dark .kv-bool { color:#67e8f9; }
+    html.dark .kv-obj  { color:#cbd5e1; }
+
+    /* table_artifact in dark mode — invert the zebra stripe (lift the alt
+       row a hair *above* the panel surface instead of darkening it). The
+       light-mode rgba was a tint of slate-900 over white; the dark-mode
+       version is a tint of white over slate-800 so cells still read as a
+       single surface and the white text keeps its contrast. */
+    html.dark .table-zebra > tbody > tr:nth-child(even) { background-color: rgba(255, 255, 255, 0.035); }
+    html.dark .table-zebra > tbody > tr            { border-bottom-color: #334155; }
+    html.dark .table-zebra > thead > tr            { border-bottom-color: #475569; }
+
+    /* Spinner — use lighter ring + brighter accent on dark backgrounds */
+    html.dark .spinner { border-color:#334155; border-top-color:#60a5fa; }
+
+    /* Theme toggle icon swap — show moon in light, sun in dark */
+    html:not(.dark) .icon-sun  { display: none; }
+    html.dark      .icon-moon  { display: none; }
+
+    /* Brand logo is black artwork on transparent — invert in dark mode so
+       it stays visible against the dark surface. */
+    html.dark .brand-logo { filter: invert(1) brightness(1.05); }
+
+    /* ── View tabs above the composer ─────────────────────────────────── */
+    /* Folder-tab strip with no separator line — the bar shares its background
+       with the messages panel above so the tabs read as "attached" to the
+       chat surface. The active tab lifts off via a contrasting bg + soft
+       shadow; inactive tabs sit flush on the panel. */
+    .view-tabs-bar {
+      position: relative;
+      z-index: 5;
+      margin-top: -10px;        /* lap up into the messages panel above */
+      display: flex;
+      justify-content: center;
+      gap: 2px;
+      padding: 0 8px;
+      background: transparent;
+    }
+    .view-tab {
+      padding: .25rem 1.1rem;
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: #94a3b8;
+      background: transparent;
+      border-radius: 8px 8px 0 0;
+      transition: color .15s ease, background .15s ease;
+    }
+    .view-tab:hover  { color: #475569; background: rgba(255, 255, 255, .55); }
+    .view-tab.active {
+      color: #1e293b;
+      background: #ffffff;
+      box-shadow: 0 -1px 2px rgba(15, 23, 42, .06);
+    }
+
+    html.dark .view-tab          { color: #64748b; }
+    html.dark .view-tab:hover    { color: #cbd5e1; background: rgba(30, 41, 59, .55); }
+    html.dark .view-tab.active   {
+      color: #f1f5f9;
+      background: #1e293b;
+      box-shadow: 0 -1px 2px rgba(0, 0, 0, .35);
+    }
+
+    /* ── Debug console ─────────────────────────────────────────────────── */
+    #debug-console {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 1.25rem;
+    }
+    .wire-entry  { margin-bottom: .35rem; }
+    .wire-meta   { color: #64748b; font-size: 11px; cursor: pointer; user-select: none; }
+    .wire-meta:hover .wire-toggle { color: #cbd5e1; }
+    .wire-toggle { display: inline-block; width: 1ch; color: #475569; margin-right: .25rem; }
+    .wire-out    { color: #38bdf8; }
+    .wire-in     { color: #4ade80; }
+    .wire-error  { color: #f87171; }
+    .wire-body   { color: #cbd5e1; margin-top: .15rem; }
+    .wire-entry:not(.expanded) .wire-body { display: none; }
+    .wire-entry.expanded { margin-bottom: 1rem; }
+
+    /* When debug mode is active, force an all-black surface regardless of
+       the light/dark preference so the wire log dominates the viewport. */
+    body.debug-mode { background: #000 !important; }
+    body.debug-mode header,
+    body.debug-mode #card-panel,
+    body.debug-mode #context-bar,
+    body.debug-mode #composer,
+    body.debug-mode .bg-white,
+    body.debug-mode .bg-slate-50,
+    body.debug-mode .bg-slate-100,
+    body.debug-mode .bg-blue-50 { background: #000 !important; border-color: #1f2937 !important; }
+    body.debug-mode #agent-name,
+    body.debug-mode #cid-display,
+    body.debug-mode #card-body,
+    body.debug-mode #card-body * { color: #cbd5e1 !important; }
+    body.debug-mode #debug-console { background: #000; color: #cbd5e1; }
+    body.debug-mode .view-tabs-bar   { background: transparent !important; }
+    body.debug-mode .view-tab        { color: #4b5563; }
+    body.debug-mode .view-tab:hover  { color: #cbd5e1; background: rgba(75, 85, 99, .25); }
+    body.debug-mode .view-tab.active {
+      color: #4ade80;
+      background: #000;
+      box-shadow: 0 -1px 2px rgba(74, 222, 128, .25);
+    }
+
+    /* Selected prompt-suggestion pill — applied on click so the user
+       sees which option they picked. Works on both the in-chat pills
+       (light backdrop) and the fullscreen pills (dark backdrop); !important
+       overrides the Tailwind classes the pill normally carries. Siblings
+       get the native ``disabled`` attribute so they pick up the existing
+       ``disabled:opacity-40 / 50`` rule without extra styling. */
+    .pill-selected {
+      background-color: #2563eb !important;   /* blue-600 */
+      border-color: #1d4ed8 !important;
+      color: #ffffff !important;
+      font-weight: 500;
+      cursor: default;
+    }
+    .pill-selected:hover {
+      background-color: #1d4ed8 !important;
+      border-color: #1e40af !important;
+    }
+    html.dark .pill-selected {
+      background-color: #3b82f6 !important;
+      border-color: #60a5fa !important;
+    }
+    html.dark .pill-selected:hover {
+      background-color: #2563eb !important;
+      border-color: #93c5fd !important;
+    }

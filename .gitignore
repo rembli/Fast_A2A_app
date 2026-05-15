@@ -1,0 +1,88 @@
+Makefile
+.env
+.claude
+tmp/
+
+# image_creator local image cache
+examples/image_creator/tmp/
+
+# Python
+__pycache__
+__pycache__/
+
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pkl
+*.egg-info/
+*.egg
+*.env
+.env
+.venv
+venv/
+build/
+dist/
+.eggs/
+*.log
+*.sqlite3
+*.db
+*.DS_Store
+poetry.lock
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Test and coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+
+# PyInstaller
+*.manifest
+*.spec
+
+# C extensions
+*.so
+
+# Misc
+*.swp
+*~
+.idea/
+
+# Node
+node_modules/
+
+# Backup files
+*~
+*.bak
+*.tmp
+
+# System files
+Thumbs.db
+Desktop.ini
+
+# Examples
+examples/*/venv/
+examples/*/.env
+examples/*/.venv
+examples/*/__pycache__/
