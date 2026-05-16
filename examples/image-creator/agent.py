@@ -15,14 +15,16 @@ Tools available to the orchestrator:
   - ``web_search``         find references for styles / concepts (mock)
   - ``brand_asset_lookup`` fetch internal product packshots (mock)
 
-Slash commands (``/hello``, ``/help``, ``/models``) bypass the agent and
-short-circuit to canned responses.
+Slash commands (``/hello``, ``/help``, ``/set``) bypass the agent and
+short-circuit to canned responses. ``/set`` is a two-step pill wizard
+over the ``CONFIG_PARAMETERS`` schema (``model`` / ``size`` / ``style``).
+Slash-command parsing is case-insensitive; replies always lowercase.
 
 Two models are used per turn:
   - **Chat model** (``AZURE_AI_DEPLOYMENT_NAME``, e.g. ``gpt-4o``) for
     orchestration, intent expansion, and prompt rewriting.
-  - **Image model** (from ``MODELS`` catalog, switched via ``/models``)
-    for pixels.
+  - **Image model** (from ``CONFIG_PARAMETERS["model"]["values"]``,
+    switched via ``/set model <id>``) for pixels.
 
 Authentication: AzureCliCredential (``az login``).
 """
@@ -64,7 +66,6 @@ from config import (
     APP_BASE_URL,
     AZURE_AI_BASE_URL,
     AZURE_AI_DEPLOYMENT_NAME,
-    DEFAULT_IMAGE_SIZE as DEFAULT_SIZE,
 )
 from fast_a2a_app import (
     image_artifact,
@@ -115,17 +116,57 @@ agent_card = AgentCard(
 )
 
 
-# ── Azure OpenAI clients ──────────────────────────────────────────────────────
-# Two distinct deployments per turn: a chat model (orchestration + helper LLM
-# calls) and an image model (pixels). The chat model is fixed via env; the
-# image model is conversation-scoped and switched with ``/models``.
+# ── Configurable agent parameters ─────────────────────────────────────────────
+# Schema for the per-conversation parameters the user can switch at runtime
+# (``model`` / ``size`` / ``style``). Each entry declares a default plus an
+# enum-like ``values`` mapping (value → short description).
+#
+# Lives in agent.py — next to the code that reads it — so the schema, the
+# defaults, the slash-command handler, and the tool that consumes the
+# resolved values all sit together. ``main.py`` imports ``CONFIG_PARAMETERS``
+# verbatim and serves it at ``GET /config`` (no transformation).
+#
+# State is conversation-scoped and recovered from the related-task history by
+# scanning for ``/set <param> <value>`` user messages — no server-side store.
 
-# Image-model catalog (switched at runtime via /models slash command).
-MODELS: dict[str, str] = {
-    "gpt-image-1-mini": "Faster, lower-cost OpenAI image model. Default.",
-    "gpt-image-1": "Standard OpenAI image model — higher fidelity, slower.",
+CONFIG_PARAMETERS: dict[str, dict] = {
+    "model": {
+        "description": "Image deployment used for generation.",
+        "default": "gpt-image-1-mini",
+        "values": {
+            "gpt-image-1-mini": "Faster, lower-cost OpenAI image model.",
+            "gpt-image-1": "Higher fidelity, slower OpenAI image model.",
+        },
+    },
+    "size": {
+        "description": "Output image dimensions.",
+        "default": "1024x1024",
+        "values": {
+            "1024x1024": "Square — best general-purpose default.",
+            "1024x1536": "Portrait — vertical compositions, posters.",
+            "1536x1024": "Landscape — banners, wide scenes.",
+        },
+    },
+    "style": {
+        "description": "Visual style directive prepended to every prompt.",
+        "default": "natural",
+        "values": {
+            "natural": "Photorealistic, true-to-life rendering.",
+            "vivid": "Hyper-real, dramatic lighting and saturation.",
+            "anime": "Anime / hand-drawn illustration aesthetic.",
+            "watercolour": "Soft watercolour painting style.",
+        },
+    },
 }
-DEFAULT_MODEL = "gpt-image-1-mini"
+
+CONFIG_DEFAULTS: dict[str, str] = {
+    name: spec["default"] for name, spec in CONFIG_PARAMETERS.items()
+}
+
+
+# ── Azure OpenAI clients ──────────────────────────────────────────────────────
+# The chat model (orchestration + helper LLM calls) is fixed via env; the
+# image model (pixels) is conversation-scoped and switched via ``/set model``.
 
 _openai_client = AsyncOpenAI(
     base_url=f"{AZURE_AI_BASE_URL}/openai/v1",
@@ -148,7 +189,9 @@ _chat_model = OpenAIModel(
 class AgentDeps:
     """Per-run state passed to tools via ``RunContext[AgentDeps]``.
 
-    *image_model* is the active image deployment for this turn.
+    *config* is the resolved ``CONFIG_PARAMETERS`` snapshot for this turn
+    (``{"model": ..., "size": ..., "style": ...}``), recovered from prior
+    ``/set`` commands by :func:`_resolve_config_from_history`.
     *available_images* lists URLs the agent can pass to ``generate_image``
     as ``reference_image_url`` (current-turn uploads + the most recent
     conversation image, both pre-stored in image_store so the agent can
@@ -156,7 +199,7 @@ class AgentDeps:
     *generated* collects the artifacts produced during the run; the
     outer ``invoke`` / ``stream_invoke`` yields them after agent.run().
     """
-    image_model: str
+    config: dict[str, str]
     available_images: list[tuple[str, str]]   # [(url, label), ...]
     generated: list[Artifact] = field(default_factory=list)
 
@@ -194,6 +237,22 @@ Workflow:
    feed the findings into the prompt.
 5. For multi-step plans ("three variations" or "combine the packshot
    with my logo"), call ``generate_image`` multiple times in sequence.
+
+Active settings:
+- Every user message ends with an "Active settings:" block listing the
+  conversation-scoped parameters the user has selected via ``/set``
+  (``model``, ``size``, ``style``). These are passed *automatically* to
+  ``generate_image`` via tool deps — do NOT restate them inside the
+  ``prompt`` argument and do NOT call ``rewrite_prompt`` / ``expand_intent``
+  to inject them. They will be applied to every generated image.
+- When the active ``style`` is non-default, briefly acknowledge it in
+  your reply ("rendered in the active anime style"). Same for
+  non-default ``size`` ("in portrait orientation").
+- If the user explicitly asks for a different style/size in their
+  message ("make this one square", "try it in watercolour"), follow the
+  request for that turn without changing the persistent setting — and
+  end your reply by suggesting ``/set <param> <value>`` if they want it
+  to stick.
 
 Reply guidelines:
 - Be concise — the image speaks for itself; one or two sentences are
@@ -253,18 +312,29 @@ async def generate_image(
             if data:
                 references.append(data)
 
-    label = ctx.deps.image_model
-    if references:
-        report_progress(f"Editing with `{label}` (1 reference image)…")
+    model = ctx.deps.config["model"]
+    size = ctx.deps.config["size"]
+    style = ctx.deps.config["style"]
+
+    # Inject the style directive only when it differs from the default — keeps
+    # the prompt close to the user's intent when no style is explicitly set.
+    if style != CONFIG_PARAMETERS["style"]["default"]:
+        style_descr = CONFIG_PARAMETERS["style"]["values"].get(style, "")
+        effective_prompt = f"{style_descr.rstrip('.')}. {prompt}" if style_descr else prompt
     else:
-        report_progress(f"Generating with `{label}`…")
+        effective_prompt = prompt
+
+    if references:
+        report_progress(f"Editing with `{model}` @ {size} (1 reference image)…")
+    else:
+        report_progress(f"Generating with `{model}` @ {size} ({style})…")
 
     try:
         image_bytes, mime = await _generate_pixels(
-            ctx.deps.image_model, prompt, references,
+            model, effective_prompt, references, size,
         )
     except Exception as exc:
-        log.exception("Image generation failed (model=%s)", ctx.deps.image_model)
+        log.exception("Image generation failed (model=%s, size=%s)", model, size)
         return f"ERROR: image generation failed — {exc}"
 
     if not image_bytes:
@@ -423,7 +493,7 @@ async def brand_asset_lookup(asset_name: str) -> str:
 
 
 async def _generate_pixels(
-    model: str, prompt: str, references: list[tuple[bytes, str]],
+    model: str, prompt: str, references: list[tuple[bytes, str]], size: str,
 ) -> tuple[bytes | None, str]:
     """Call the OpenAI image API. Direct SDK call — same shape as before.
 
@@ -442,11 +512,11 @@ async def _generate_pixels(
             image=files if len(files) > 1 else files[0],
             prompt=prompt,
             n=1,
-            size=DEFAULT_SIZE,
+            size=size,
         )
     else:
         result = await _openai_client.images.generate(
-            model=model, prompt=prompt, n=1, size=DEFAULT_SIZE,
+            model=model, prompt=prompt, n=1, size=size,
         )
 
     items = getattr(result, "data", None) or []
@@ -547,16 +617,18 @@ def _latest_image_in_history(context: RequestContext) -> tuple[bytes, str] | Non
     return latest
 
 
-def _select_model_from_history(context: RequestContext) -> str:
-    """Latest valid ``/models <name>`` in related-task history wins.
+def _resolve_config_from_history(context: RequestContext) -> dict[str, str]:
+    """Walk related-task history for ``/set <param> <value>`` commands.
 
-    Slash-command state is conversation-scoped. A2A history is already
-    persisted in Redis by fast_a2a_app, so deriving the active model from
-    past ``/models`` commands avoids introducing a second persistence
-    layer just for this preference.
+    Latest valid assignment wins per parameter. Unset parameters fall back to
+    ``CONFIG_PARAMETERS[<name>]["default"]``. A2A history is already persisted
+    by fast_a2a_app, so deriving config from past ``/set`` commands avoids a
+    second persistence layer just for these preferences. Matching is
+    case-insensitive — the parameter name is normalised to lowercase, the
+    value is preserved as-typed.
     """
+    config = dict(CONFIG_DEFAULTS)
     related = getattr(context, "related_tasks", None) or []
-    selections: list[str] = []
     for task in related:
         for msg in getattr(task, "history", None) or []:
             if getattr(msg, "role", 0) != Role.ROLE_USER:
@@ -564,10 +636,18 @@ def _select_model_from_history(context: RequestContext) -> str:
             for part in getattr(msg, "parts", None) or []:
                 if part.WhichOneof("content") != "text":
                     continue
-                match = _MODELS_CMD.match(part.text.strip())
-                if match and match.group(1) and match.group(1) in MODELS:
-                    selections.append(match.group(1))
-    return selections[-1] if selections else DEFAULT_MODEL
+                match = _SET_CMD.match(part.text.strip())
+                if not match:
+                    continue
+                param = (match.group(1) or "").lower()
+                value = match.group(2) or ""
+                if (
+                    param in CONFIG_PARAMETERS
+                    and value
+                    and value in CONFIG_PARAMETERS[param]["values"]
+                ):
+                    config[param] = value
+    return config
 
 
 def _build_message_history(context: RequestContext) -> list[ModelMessage]:
@@ -641,16 +721,30 @@ def _build_message_history(context: RequestContext) -> list[ModelMessage]:
 
 
 # ── Slash commands ────────────────────────────────────────────────────────────
-# Deterministic UI shortcuts (``/hello``, ``/help``, ``/models``) that bypass
-# the agent loop. Each text builder produces the body of one canned response;
-# ``_handle_slash_command`` dispatches based on the raw user text.
+# Deterministic UI shortcuts (``/hello``, ``/help``, ``/set``) that bypass the
+# agent loop. Slash-command parsing is case-insensitive throughout, but every
+# pill, docstring, and message uses lowercase. ``/set`` is a two-step wizard
+# backed by ``CONFIG_PARAMETERS``:
+#
+#   /set                  → pills: one per parameter name + cancel
+#   /set <param>          → pills: one per allowed value + cancel
+#   /set <param> <value>  → confirmation (assignment is recovered from
+#                           history on the next turn by
+#                           :func:`_resolve_config_from_history`)
+#   /set cancel           → acknowledged at either step, no state change
 
 
-# Matches ``/models`` (list) and ``/models <name>`` (switch).
-_MODELS_CMD = re.compile(r"^/models\s*(\S+)?\s*$", re.IGNORECASE)
+# Matches ``/set``, ``/set <param>``, and ``/set <param> <value>``. Input is
+# case-insensitive; the handler lowercases the captured parameter name.
+_SET_CMD = re.compile(r"^/set(?:\s+(\S+))?(?:\s+(\S+))?\s*$", re.IGNORECASE)
 
 
-def _hello_text() -> str:
+def _format_config_summary(config: dict[str, str]) -> str:
+    """One-line ``key=value`` summary of the current parameter snapshot."""
+    return " · ".join(f"`{name}`=`{config[name]}`" for name in CONFIG_PARAMETERS)
+
+
+def _hello_text(config: dict[str, str]) -> str:
     """Markdown body for the welcome message (``/hello``)."""
     return (
         "👋 **Welcome to the Image Creator agent.**\n\n"
@@ -660,13 +754,13 @@ def _hello_text() -> str:
         ") and I'll plan, generate, and iterate.\n\n"
         "Quick commands:\n"
         "- `/help` — what I can do\n"
-        "- `/models` — show / switch the active image deployment\n\n"
-        f"Image deployment: `{DEFAULT_MODEL}`. "
+        "- `/set` — change `model`, `size`, or `style` for this conversation\n\n"
+        f"Current settings: {_format_config_summary(config)}.\n"
         f"Orchestration: `{AZURE_AI_DEPLOYMENT_NAME}`."
     )
 
 
-def _help_text(active_model: str) -> str:
+def _help_text(config: dict[str, str]) -> str:
     """Markdown body for the capabilities cheatsheet (``/help``)."""
     return (
         "**Image Creator — capabilities**\n\n"
@@ -681,47 +775,56 @@ def _help_text(active_model: str) -> str:
         "**Slash commands**\n"
         "- `/hello` — welcome message\n"
         "- `/help` — this message\n"
-        "- `/models` — show / switch the active image deployment\n\n"
-        f"Image deployment: `{active_model}`. "
+        "- `/set` — change `model`, `size`, or `style` for this conversation\n\n"
+        f"Current settings: {_format_config_summary(config)}.\n"
         f"Orchestration: `{AZURE_AI_DEPLOYMENT_NAME}`."
     )
 
 
-def _models_list_text(active_model: str) -> str:
-    """Markdown listing of available image models with the active one marked."""
-    lines = ["**Available models**", ""]
-    for model_id, blurb in MODELS.items():
-        marker = "✅" if model_id == active_model else "•"
-        suffix = "  *(default)*" if model_id == DEFAULT_MODEL else ""
-        lines.append(f"{marker} `{model_id}`{suffix} — {blurb}")
-    lines.append("")
-    lines.append("Click a suggestion below to switch.")
-    return "\n".join(lines)
-
-
-def _models_listing_artifact(active_model: str) -> Artifact:
-    """Build the ``/models`` reply: model list + one switch-pill per inactive model."""
-    suggestions: list[dict[str, str]] = []
-    for model_id in MODELS:
-        if model_id == active_model:
-            continue
-        label = f"Use {model_id}"
-        if model_id == DEFAULT_MODEL:
-            label += " (default)"
-        suggestions.append({"label": label, "prompt": f"/models {model_id}"})
+def _set_step1_artifact(config: dict[str, str]) -> Artifact:
+    """``/set`` reply: one pill per parameter name + cancel."""
+    suggestions = [
+        {
+            "label": f"{name} (now: {config[name]})",
+            "prompt": f"/set {name}",
+        }
+        for name in CONFIG_PARAMETERS
+    ]
+    suggestions.append({"label": "cancel", "prompt": "/set cancel"})
     return prompt_suggestions_artifact(
         suggestions,
-        text=_models_list_text(active_model),
+        text="**Which parameter do you want to change?**",
     )
 
 
-def _handle_slash_command(user_text: str, active_model: str) -> Artifact | None:
+def _set_step2_artifact(param: str, config: dict[str, str]) -> Artifact:
+    """``/set <param>`` reply: one pill per allowed value + cancel."""
+    spec = CONFIG_PARAMETERS[param]
+    current = config[param]
+    suggestions = [
+        {
+            "label": f"{value}{' ✓' if value == current else ''}",
+            "prompt": f"/set {param} {value}",
+        }
+        for value in spec["values"]
+    ]
+    suggestions.append({"label": "cancel", "prompt": "/set cancel"})
+
+    lines = [f"**Choose a value for `{param}`** — {spec['description']}", ""]
+    for value, blurb in spec["values"].items():
+        marker = "✅" if value == current else "•"
+        suffix = "  *(default)*" if value == spec["default"] else ""
+        lines.append(f"{marker} `{value}`{suffix} — {blurb}")
+    return prompt_suggestions_artifact(suggestions, text="\n".join(lines))
+
+
+def _handle_slash_command(user_text: str, config: dict[str, str]) -> Artifact | None:
     """Bypass the agent loop for deterministic UI shortcuts.
 
     Returns an Artifact for matched commands or ``None`` to fall through.
-    Slash commands are deterministic, don't need an LLM, and detection
-    must run on the raw user text — the history-augmented prompt would
-    drag earlier ``/help`` mentions into the current turn.
+    Detection runs on the raw user text — the history-augmented prompt
+    would drag earlier ``/help`` mentions into the current turn. Matching
+    is case-insensitive but every reply uses lowercase command tokens.
     """
     lowered = user_text.lower()
     if lowered == "/hello":
@@ -729,25 +832,45 @@ def _handle_slash_command(user_text: str, active_model: str) -> Artifact | None:
         # surfaced where the user actually needs a nudge (empty composer
         # state, no-prompt-with-image state); pinning them to /hello
         # crowded a fresh chat with buttons the user hadn't asked for.
-        return text_artifact(_hello_text())
+        return text_artifact(_hello_text(config))
     if lowered == "/help":
-        return text_artifact(_help_text(active_model))
+        return text_artifact(_help_text(config))
 
-    cmd = _MODELS_CMD.match(user_text)
+    cmd = _SET_CMD.match(user_text)
     if not cmd:
         return None
 
-    requested = cmd.group(1)
-    if not requested:
-        return _models_listing_artifact(active_model)
-    if requested not in MODELS:
-        allowed = ", ".join(f"`{m}`" for m in MODELS)
+    param = (cmd.group(1) or "").lower()
+    value = cmd.group(2) or ""
+
+    # /set — step 1: pick a parameter.
+    if not param:
+        return _set_step1_artifact(config)
+
+    # cancel pill clicked at either step.
+    if param == "cancel":
+        return text_artifact("Cancelled — no parameters changed.")
+
+    if param not in CONFIG_PARAMETERS:
+        allowed = ", ".join(f"`{p}`" for p in CONFIG_PARAMETERS)
         return text_artifact(
-            f"Unknown model `{requested}`. Available models: {allowed}.\n\n"
-            "Type `/models` to pick one."
+            f"Unknown parameter `{param}`. Valid parameters: {allowed}.\n\n"
+            "Type `/set` to pick one."
+        )
+
+    # /set <param> — step 2: pick a value.
+    if not value:
+        return _set_step2_artifact(param, config)
+
+    # /set <param> <value> — assignment.
+    if value not in CONFIG_PARAMETERS[param]["values"]:
+        allowed = ", ".join(f"`{v}`" for v in CONFIG_PARAMETERS[param]["values"])
+        return text_artifact(
+            f"Unknown value `{value}` for `{param}`. Valid values: {allowed}.\n\n"
+            f"Type `/set {param}` to pick one."
         )
     return text_artifact(
-        f"✅ Switched to `{requested}` for this conversation."
+        f"✅ `{param}` set to `{value}` for this conversation."
     )
 
 
@@ -816,7 +939,7 @@ _REFINEMENT_SUGGESTIONS: list[dict[str, str]] = [
 def _prepare_run(
     user_text: str,
     attached_images: list[tuple[bytes, str]],
-    active_model: str,
+    config: dict[str, str],
     context: RequestContext,
 ) -> tuple[AgentDeps, str]:
     """Build deps + a prompt containing reference URLs the agent can use.
@@ -851,18 +974,30 @@ def _prepare_run(
             ))
 
     deps = AgentDeps(
-        image_model=active_model,
+        config=config,
         available_images=available_images,
     )
 
+    # Build a per-turn preamble listing the active /set parameters so the
+    # orchestrator LLM is aware of them — without this, the model has no
+    # context that the user has explicitly chosen a style or size, and
+    # produces replies that ignore the active settings. The values are
+    # *also* passed directly to ``generate_image`` via ``ctx.deps.config``,
+    # so the model never has to forward them as tool arguments.
+    settings_lines = [
+        f"- {name}: {config[name]}"
+        + (" (default)" if config[name] == CONFIG_PARAMETERS[name]["default"] else "")
+        for name in CONFIG_PARAMETERS
+    ]
+    settings_block = "Active settings:\n" + "\n".join(settings_lines)
+
+    sections: list[str] = []
     if available_images:
         ref_lines = [f"- {url} ({label})" for url, label in available_images]
-        prompt_with_refs = (
-            "Available references:\n" + "\n".join(ref_lines)
-            + "\n\nUser: " + user_text
-        )
-    else:
-        prompt_with_refs = user_text
+        sections.append("Available references:\n" + "\n".join(ref_lines))
+    sections.append("User: " + user_text)
+    sections.append(settings_block)
+    prompt_with_refs = "\n\n".join(sections)
 
     return deps, prompt_with_refs
 
@@ -920,9 +1055,9 @@ async def invoke(prompt: str, context: RequestContext) -> Artifact:
     in how they return the result — one Artifact vs. multiple yields.
     """  # noqa: ARG001 — prompt is part of the framework contract
     user_text, attached_images = _extract_input(context)
-    active_model = _select_model_from_history(context)
+    config = _resolve_config_from_history(context)
 
-    if response := _handle_slash_command(user_text, active_model):
+    if response := _handle_slash_command(user_text, config):
         return response
 
     if not user_text and not attached_images:
@@ -937,7 +1072,7 @@ async def invoke(prompt: str, context: RequestContext) -> Artifact:
         )
 
     deps, prompt_with_refs = _prepare_run(
-        user_text, attached_images, active_model, context,
+        user_text, attached_images, config, context,
     )
     result = await image_agent.run(
         prompt_with_refs,
@@ -964,9 +1099,9 @@ async def stream_invoke(
     immediate feedback as each ``generate_image`` call completes.
     """  # noqa: ARG001
     user_text, attached_images = _extract_input(context)
-    active_model = _select_model_from_history(context)
+    config = _resolve_config_from_history(context)
 
-    if response := _handle_slash_command(user_text, active_model):
+    if response := _handle_slash_command(user_text, config):
         yield response
         return
 
@@ -984,7 +1119,7 @@ async def stream_invoke(
         return
 
     deps, prompt_with_refs = _prepare_run(
-        user_text, attached_images, active_model, context,
+        user_text, attached_images, config, context,
     )
     result = await image_agent.run(
         prompt_with_refs,

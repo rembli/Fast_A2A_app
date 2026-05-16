@@ -17,8 +17,10 @@ Requires:
 - Redis (``docker run -d -p 6379:6379 redis:7-alpine``)
 - Azure CLI auth (``az login``)
 - ``AZURE_AI_BASE_URL`` env var pointing at your Azure AI Foundry host (no path)
-- The active image deployment is picked from the in-file ``MODELS`` catalog
-  in ``agent.py`` (``gpt-image-1-mini`` by default; switch with ``/models``).
+- The active image deployment / size / style are picked from
+  ``CONFIG_PARAMETERS`` in ``agent.py`` (defaults: ``gpt-image-1-mini``,
+  ``1024x1024``, ``natural``; switch per-conversation with ``/set``).
+- The same schema is exposed at ``GET /config``.
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ from fast_a2a_app import (  # noqa: E402
     build_invoke,
     build_stream_invoke,
 )
-from agent import agent_card, invoke, stream_invoke  # noqa: E402
+from agent import CONFIG_PARAMETERS, agent_card, invoke, stream_invoke  # noqa: E402
 from config import (  # noqa: E402
     ALLOWED_UPLOAD_TYPES,
     DEBUG,
@@ -66,6 +68,19 @@ app.add_middleware(
 @app.get("/health", tags=["ops"])
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/config", tags=["ops"])
+async def get_config() -> dict:
+    """Expose the per-conversation parameter schema (``model`` / ``size`` /
+    ``style``) along with each parameter's default and allowed values.
+
+    The schema lives in ``agent.CONFIG_PARAMETERS`` next to the code that
+    reads it; this endpoint just serves it verbatim so external clients
+    (admin UIs, monitoring, the chat UI itself) can discover what the
+    ``/set`` slash command can switch.
+    """
+    return CONFIG_PARAMETERS
 
 
 @app.get("/images/{image_id}", tags=["images"])

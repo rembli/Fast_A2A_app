@@ -2,8 +2,38 @@
 
 ## Unreleased
 
+### Added
+
+- **Configurable agent parameters via `/set` (image-creator example)** —
+  a generalisable pattern for runtime-switchable agent knobs without
+  redeploying. `agent.CONFIG_PARAMETERS` declares a single schema (per
+  parameter: `description`, `default`, enum-like `values` map);
+  `main.py` exposes it verbatim at `GET /config`. A two-step pill
+  wizard drives changes (`/set` → parameter pills, `/set <param>` →
+  value pills, `/set <param> <value>` → confirmation; a `cancel` pill
+  is always offered). State is conversation-scoped and re-derived each
+  turn by walking `context.related_tasks` for past `/set` commands —
+  no server-side store. Slash-command parsing is case-insensitive;
+  pills and docs use lowercase by convention. Documented in a new
+  [how-to section](docs/how-to.md#configurable-parameters-via-set) and
+  in [SKILL.md](SKILL.md#configurable-parameters-via-set).
+
 ### Changed
 
+- **`image-creator` example: `/models` replaced by `/set model …`.**
+  The single-purpose `/models` slash command (catalog list + switcher)
+  is gone. The new `/set` wizard covers the same ground plus
+  conversation-scoped `size` and `style` parameters. The previous
+  `IMAGE_SIZE` env var is removed — output dimensions are now picked
+  per-turn via `/set size`. `STYLE` is prepended to the prompt for
+  every generated image when non-default.
+- **`image-creator` example: orchestrator LLM now sees the active
+  settings.** Every user message gets an `Active settings:` preamble
+  listing the resolved `model` / `size` / `style`, and the system
+  prompt instructs the LLM to acknowledge non-default values in its
+  reply without restating them as tool arguments. Without this the
+  values reached `_generate_pixels` correctly but the agent's text
+  replies were oblivious to the user's choices.
 - **`SKILL.md` rewritten around `agent.py`** — `AgentCard` reference, the two
   callable shapes (`invoke` / `stream_invoke`), and a pydantic-ai
   `Agent[AgentDeps]` + `@agent.tool` pattern are now front-and-center.

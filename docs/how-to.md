@@ -9,6 +9,7 @@ Task-oriented recipes. For the full surface of each function, see the [API refer
 - [Prompt management](#prompt-management)
 - [Multi-part responses](#multi-part-responses)
 - [Live progress updates](#live-progress-updates)
+- [Configurable parameters via `/set`](#configurable-parameters-via-set)
 - [File attachments](#file-attachments)
 - [UI rendering conventions](#ui-rendering-conventions)
 - [Lifecycle hooks](#lifecycle-hooks)
@@ -356,6 +357,197 @@ async def fetch_destinations(criteria: str) -> list[str]:
 ```
 
 The status appears in the working-state indicator in the UI until the next status update or the final result.
+
+---
+
+## Configurable parameters via `/set`
+
+When you want the user to switch knobs at runtime (which model, output size, output style, verbosity, …) without redeploying, declare a **single schema dict** in `agent.py`, drive a two-step slash-command wizard from it, and re-derive the active values from the conversation history each turn. No server-side store, no env-var-restart cycle, no duplicate truth.
+
+Implemented end-to-end in [examples/image-creator/agent.py](../examples/image-creator/agent.py) and [examples/image-creator/main.py](../examples/image-creator/main.py).
+
+### 1. Declare the schema in `agent.py`
+
+```python
+# agent.py
+CONFIG_PARAMETERS: dict[str, dict] = {
+    "model": {
+        "description": "Image deployment used for generation.",
+        "default": "gpt-image-1-mini",
+        "values": {
+            "gpt-image-1-mini": "Faster, lower-cost.",
+            "gpt-image-1":      "Higher fidelity, slower.",
+        },
+    },
+    "size": {
+        "description": "Output image dimensions.",
+        "default": "1024x1024",
+        "values": {
+            "1024x1024": "Square.",
+            "1024x1536": "Portrait.",
+            "1536x1024": "Landscape.",
+        },
+    },
+}
+
+CONFIG_DEFAULTS = {name: spec["default"] for name, spec in CONFIG_PARAMETERS.items()}
+```
+
+Keep the schema next to the code that reads it — defaults, value enums, slash-command handler, and the tool that consumes the resolved values all live in one file.
+
+### 2. Expose the schema at `GET /config`
+
+```python
+# main.py
+from agent import CONFIG_PARAMETERS
+
+@app.get("/config", tags=["ops"])
+async def get_config() -> dict:
+    return CONFIG_PARAMETERS
+```
+
+The endpoint serves the schema verbatim — no transformation. Admin UIs, monitoring, and the chat UI itself can discover what `/set` can switch.
+
+### 3. Drive a two-step pill wizard from the same schema
+
+```python
+# agent.py — case-insensitive parsing, lowercase replies by convention
+_SET_CMD = re.compile(r"^/set(?:\s+(\S+))?(?:\s+(\S+))?\s*$", re.IGNORECASE)
+
+def _handle_set_command(user_text: str, config: dict[str, str]) -> Artifact | None:
+    cmd = _SET_CMD.match(user_text)
+    if not cmd:
+        return None
+    param = (cmd.group(1) or "").lower()
+    value = cmd.group(2) or ""
+
+    if not param:                                  # /set → step 1
+        suggestions = [
+            {"label": f"{n} (now: {config[n]})", "prompt": f"/set {n}"}
+            for n in CONFIG_PARAMETERS
+        ] + [{"label": "cancel", "prompt": "/set cancel"}]
+        return prompt_suggestions_artifact(suggestions, text="**Which parameter?**")
+
+    if param == "cancel":
+        return text_artifact("Cancelled — no parameters changed.")
+
+    if param not in CONFIG_PARAMETERS:
+        return text_artifact(f"Unknown parameter `{param}`.")
+
+    if not value:                                  # /set <param> → step 2
+        spec = CONFIG_PARAMETERS[param]
+        suggestions = [
+            {"label": v, "prompt": f"/set {param} {v}"}
+            for v in spec["values"]
+        ] + [{"label": "cancel", "prompt": "/set cancel"}]
+        return prompt_suggestions_artifact(
+            suggestions,
+            text=f"**Choose a value for `{param}`** — {spec['description']}",
+        )
+
+    if value not in CONFIG_PARAMETERS[param]["values"]:
+        return text_artifact(f"Unknown value `{value}` for `{param}`.")
+
+    return text_artifact(f"✅ `{param}` set to `{value}` for this conversation.")
+```
+
+Each step's reply is a `prompt_suggestions_artifact` whose pills carry **the next command** in their `prompt` field — clicking advances the wizard.
+
+### 4. Recover the active values from history each turn
+
+```python
+def _resolve_config_from_history(context: RequestContext) -> dict[str, str]:
+    """Walk related-task history for /set <param> <value> commands.
+    Latest valid assignment wins per parameter; unset parameters fall back
+    to CONFIG_PARAMETERS[<name>]["default"]."""
+    config = dict(CONFIG_DEFAULTS)
+    for task in getattr(context, "related_tasks", None) or []:
+        for msg in getattr(task, "history", None) or []:
+            if getattr(msg, "role", 0) != Role.ROLE_USER:
+                continue
+            for part in getattr(msg, "parts", None) or []:
+                if part.WhichOneof("content") != "text":
+                    continue
+                m = _SET_CMD.match(part.text.strip())
+                if not m:
+                    continue
+                param = (m.group(1) or "").lower()
+                value = m.group(2) or ""
+                if (
+                    param in CONFIG_PARAMETERS
+                    and value
+                    and value in CONFIG_PARAMETERS[param]["values"]
+                ):
+                    config[param] = value
+    return config
+```
+
+A2A history is already persisted by `fast_a2a_app` (in `MemoryTaskStore` / Redis / Mongo / Postgres). Deriving config from past `/set` commands avoids introducing a second persistence layer for what is effectively cached user input — and survives reloads, multi-process deployments, and process restarts for free.
+
+### 5. Use the resolved config inside your tools (direct path)
+
+The values reach the tools without going through the LLM — pass them via `RunContext` deps so the orchestrator never has to forward them as tool arguments.
+
+```python
+@dataclass
+class AgentDeps:
+    config: dict[str, str]
+    # …
+
+@my_agent.tool
+async def generate_image(ctx: RunContext[AgentDeps], prompt: str) -> str:
+    model = ctx.deps.config["model"]
+    size  = ctx.deps.config["size"]
+    style = ctx.deps.config["style"]
+    # … pass them to the underlying API call.
+```
+
+### 6. Tell the orchestrator about the active settings (LLM path)
+
+This step is easy to miss — and on its own, step 5 is **not enough**. The values reach `generate_image` correctly, but the orchestrator LLM has no idea what the active `model` / `size` / `style` are, so its textual replies ignore them and it may re-state them inside the tool prompt anyway.
+
+Prepend an `Active settings:` block to the prompt fed into `agent.run()`, *in addition* to the deps wiring:
+
+```python
+async def stream_invoke(prompt, context):
+    config = _resolve_config_from_history(context)
+    if reply := _handle_slash_command(user_text, config):
+        yield reply
+        return
+
+    settings_lines = [
+        f"- {name}: {config[name]}"
+        + (" (default)" if config[name] == CONFIG_PARAMETERS[name]["default"] else "")
+        for name in CONFIG_PARAMETERS
+    ]
+    prompt_with_settings = f"User: {user_text}\n\nActive settings:\n" + "\n".join(settings_lines)
+
+    deps = AgentDeps(config=config, …)
+    result = await my_agent.run(prompt_with_settings, deps=deps, …)
+```
+
+And tell the orchestrator how to behave with this preamble in the system prompt:
+
+```text
+Active settings:
+- Every user message ends with an "Active settings:" block listing the
+  conversation-scoped parameters (model, size, style). These are passed
+  AUTOMATICALLY to generate_image via tool deps — do NOT restate them
+  inside the prompt argument.
+- When the active style is non-default, briefly acknowledge it in your
+  reply ("rendered in the active anime style"). Same for non-default size.
+- If the user asks for a one-off override in their message, follow it
+  without changing the persistent setting — and end the reply by
+  suggesting `/set <param> <value>` if they want it to stick.
+```
+
+### Why this shape
+
+- **Single source of truth.** Adding a parameter or a value is a one-line edit to `CONFIG_PARAMETERS`. The `/set` pills, `GET /config` payload, validation, and confirmation messages all pick it up automatically.
+- **No server-side state.** The history walker is idempotent; turns are reproducible from the transcript alone. Works the same in single-process memory and multi-process Redis/Mongo/Postgres deployments.
+- **Catalog-only by design.** Unknown parameter names and unknown values are rejected with a recovery hint. The model in `generate_image` only ever sees values that are in the enum.
+- **Case-insensitive in, lowercase out.** `/SET Model gpt-image-1`, `/Set MODEL gpt-image-1`, and `/set model gpt-image-1` all behave the same; pills and docs use lowercase by convention so the surface reads consistently.
+- **Both wiring paths matter.** Tool deps (step 5) make sure the API receives the right values. The system-prompt preamble (step 6) makes sure the LLM's replies acknowledge them. Skip step 6 and the user's `/set style anime` will be honoured by `generate_image` but the agent's text reply will pretend nothing changed.
 
 ---
 

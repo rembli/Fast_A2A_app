@@ -6,6 +6,11 @@ exposed as plain module-level constants. The rest of the codebase
 imports the names instead of repeating ``os.environ.get(...)`` calls so
 the override surface is one file, not a grep across multiple modules.
 
+Per-conversation parameters that the user can switch at runtime
+(``model`` / ``size`` / ``style``) are *not* here — they live in
+``agent.py`` as ``CONFIG_PARAMETERS`` so the schema, defaults, and the
+behaviour that reads them all sit next to each other.
+
 Override any value at runtime by setting the matching env var (or
 adding it to ``examples/.env``, which ``main.py`` loads via
 ``python-dotenv`` before this module is first imported).
@@ -26,10 +31,6 @@ AZURE_AI_BASE_URL = os.environ.get("AZURE_AI_BASE_URL", "").strip().rstrip("/")
 AZURE_AI_DEPLOYMENT_NAME = (
     os.environ.get("AZURE_AI_DEPLOYMENT_NAME", "").strip() or "gpt-5.4-mini"
 )
-
-# ── Image generation ──────────────────────────────────────────────────────────
-
-DEFAULT_IMAGE_SIZE = os.environ.get("IMAGE_SIZE", "1024x1024")
 
 # ── Uploads ───────────────────────────────────────────────────────────────────
 

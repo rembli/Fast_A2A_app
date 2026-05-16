@@ -21,9 +21,10 @@ Dependencies are managed by the parent project's `pyproject.toml` — a single `
 - **URL-based image artifacts** — generated and uploaded images live in `image_store` (filesystem under `tmp/`); the agent ships only `/images/<id>` URLs over the wire. Transcripts stay compact and survive a refresh because the UI re-fetches via the sibling endpoint.
 - **Multi-part user input** — attach button in the UI uploads images via `POST /images` so even base64 data never enters `localStorage`.
 - **Fullscreen image viewer** — click any image in the chat for a lightbox with prev/next navigation; the dedicated input there sends the currently-viewed image as a reference and stays open while the agent generates the next image (loader resumes on reopen if the user closed mid-turn).
-- **Slash commands** — `/hello`, `/help`, `/models`, `/models <id>` short-circuit the agent and return canned responses (no LLM call). `/hello` is text-only — the starter prompts surface where they earn their keep (empty composer, image-without-text uploads, post-generation refinement) rather than pinning them to the welcome turn.
+- **Slash commands** — `/hello`, `/help`, and the two-step `/set` wizard short-circuit the agent and return canned responses (no LLM call). Parsing is case-insensitive (`/SET`, `/Set`, `/set` all work); replies and pills always use lowercase. `/hello` is text-only — the starter prompts surface where they earn their keep (empty composer, image-without-text uploads, post-generation refinement) rather than pinning them to the welcome turn.
+- **Configurable parameters via `/set`** — `model`, `size`, and `style` are declared as a schema in `agent.CONFIG_PARAMETERS` (default + enum-like value map per parameter) and exposed verbatim at `GET /config`. The chat UI uses pills: `/set` lists parameters, `/set <param>` lists allowed values, `/set <param> <value>` confirms. A `cancel` pill is always offered.
 - **`accepted_file_types` on the file picker** — `build_a2a_ui(file_upload_api=..., accepted_file_types=[...])` narrows the chat's file picker to the formats the server actually accepts (`image/png`, `image/jpeg`, `image/webp`, `image/gif`). Non-image attachments would render a generic file tile rather than a broken-image thumbnail anyway, but matching server and picker keeps the UX clean.
-- **Conversation-scoped state** — active image model is recovered by scanning prior `/models <id>` commands in the related-task history.
+- **Conversation-scoped state** — the active `model` / `size` / `style` are recovered each turn by scanning prior `/set <param> <value>` commands in the related-task history — no server-side store.
 
 ## Tools (in `agent.py`)
 
@@ -40,18 +41,25 @@ Dependencies are managed by the parent project's `pyproject.toml` — a single `
 | Command | Effect |
 |---|---|
 | `/hello` | Welcome message — auto-sent by the UI on a new context. |
-| `/help` | Capabilities summary. |
-| `/models` | List + switch image models (catalog-only). |
-| `/models <id>` | Switch the image deployment for this conversation. |
+| `/help` | Capabilities summary + current parameter snapshot. |
+| `/set` | Step 1: pills listing every configurable parameter + `cancel`. |
+| `/set <param>` | Step 2: pills listing every allowed value for that parameter + `cancel`. |
+| `/set <param> <value>` | Assignment — confirmed for this conversation. |
+| `/set cancel` | Acknowledged at either step; no parameter changes. |
 
-## Image-model catalog
+Parsing is case-insensitive (`/SET MODEL gpt-image-1`, `/set model gpt-image-1`, and `/Set Model gpt-image-1` all work) — the docs and pills use lowercase by convention.
 
-| ID | Notes |
-|---|---|
-| `gpt-image-1-mini` (default) | Faster, lower-cost. |
-| `gpt-image-1` | Higher fidelity, slower. |
+## Configurable parameters
 
-To enable a different image deployment, add an entry to the `MODELS` dict in `agent.py`. (Catalog-only by design — `/models <unknown-name>` is rejected.)
+Declared in [agent.py](agent.py) as `CONFIG_PARAMETERS` and served verbatim at `GET /config`.
+
+| Parameter | Default | Allowed values |
+|---|---|---|
+| `model` | `gpt-image-1-mini` | `gpt-image-1-mini`, `gpt-image-1` |
+| `size` | `1024x1024` | `1024x1024`, `1024x1536`, `1536x1024` |
+| `style` | `natural` | `natural`, `vivid`, `anime`, `watercolour` |
+
+To add a new parameter (or a new value for an existing one), edit `CONFIG_PARAMETERS` in `agent.py` — the slash-command UI and the `GET /config` endpoint both pick it up automatically. Catalog-only by design: unknown parameter names and unknown values are rejected.
 
 ## Running
 
@@ -64,9 +72,6 @@ az login
 # In examples/.env (shared with joke-agent / holiday-planner):
 #   AZURE_AI_BASE_URL=https://<your-resource>.services.ai.azure.com
 #   AZURE_AI_DEPLOYMENT_NAME=gpt-4o     # chat model for orchestration
-
-# Optional — overrides the default 1024x1024 image output size
-export IMAGE_SIZE=1024x1024
 
 # 3. Start Redis (optional — falls back to memory if REDIS_URL unset)
 docker run -d -p 6379:6379 redis:7-alpine
