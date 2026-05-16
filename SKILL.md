@@ -3,10 +3,6 @@ name: FAST_A2A_APP
 description: Build a production-ready AI agent with the fast_a2a_app library — a FastAPI-mounted A2A (Agent2Agent) JSON-RPC server with a built-in chat UI. Use when scaffolding, generating, or extending an AI agent that should expose A2A endpoints, ship a chat UI, support streaming, multi-turn history, tools, file uploads, or multi-part artifacts. Triggers on phrases like "build an agent", "A2A server", "fast_a2a_app", "add a chat UI", "expose my agent", or any request that combines an LLM/runtime with a FastAPI surface.
 license: MIT
 compatibility: Requires Python 3.11+ and FastAPI. The default in-process `MemoryTaskStore` needs no external service; for multi-process deployments swap in `RedisTaskStore` / `MongoTaskStore` / `PostgresTaskStore`. Built on a2a-sdk 1.0.x.
-metadata:
-  author: rembli
-  homepage: https://github.com/rembli/fast_a2a_app
-  version: "0.6.0"
 allowed-tools: Read Write Edit Bash Grep Glob
 ---
 
