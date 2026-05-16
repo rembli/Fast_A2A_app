@@ -139,6 +139,24 @@ The Azure-backed examples (`joke-agent`, `image-creator`, `holiday-planner`) add
 
 ---
 
+## Scaffold a new agent with [SKILL.md](SKILL.md)
+
+The repo ships a [SKILL.md](SKILL.md) at the project root, loosely following the [Agent Skills](https://agentskills.io/specification) format — drop it into any skills-aware coding agent (Claude Code, Cursor, etc.) and ask it to scaffold a fresh `fast_a2a_app` project for you. The skill encodes the `agent.py` contract (`AgentCard`, `invoke` / `stream_invoke`), the recommended pydantic-ai shape (`Agent[AgentDeps]` + `@agent.tool` + `report_progress`), the `main.py` boilerplate, and the hard rules / pitfalls / verification checklist.
+
+Typical workflow for a brand-new repo:
+
+```bash
+mkdir my-agent && cd my-agent
+git init
+mkdir -p .claude/skills/FAST_A2A_APP
+curl -L https://raw.githubusercontent.com/rembli/fast_a2a_app/main/SKILL.md \
+  -o .claude/skills/FAST_A2A_APP/SKILL.md
+```
+
+Then prompt your agent: *"Use the fast-a2a-app skill to scaffold a pydantic-ai-based holiday-planning agent with a `recommend_destinations` tool."* The skill takes care of `pyproject.toml` deps, the two-file layout, the `AgentCard` fields, history wiring, and the boot test.
+
+---
+
 ## Documentation
 
 - **[Design choices](docs/design.md)** — what the library is, what it isn't, and the trade-offs behind those decisions

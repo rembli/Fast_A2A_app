@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`SKILL.md` rewritten around `agent.py`** — `AgentCard` reference, the two
+  callable shapes (`invoke` / `stream_invoke`), and a pydantic-ai
+  `Agent[AgentDeps]` + `@agent.tool` pattern are now front-and-center.
+  `main.py` boilerplate, `build_a2a_app` knobs, and the multi-turn/HITL
+  section compressed to essentials. pydantic-ai called out as the
+  recommended framework.
+
 ## 0.6.0 — 2026-05-11
 
 ### Fixed
