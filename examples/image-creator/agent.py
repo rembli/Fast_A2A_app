@@ -34,7 +34,6 @@ import asyncio
 import base64
 import io
 import logging
-import re
 import uuid
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
@@ -72,6 +71,16 @@ from fast_a2a_app import (
     prompt_suggestions_artifact,
     report_progress,
     text_artifact,
+)
+from fast_a2a_app.server.commons.config import (
+    ACTIVE_SETTINGS_CONVENTION,
+    format_active_settings,
+    handle_set_command,
+    resolve_config_from_history,
+)
+from fast_a2a_app.server.commons.uploads import (
+    extract_current_turn,
+    latest_file_in_history,
 )
 from image_store import store as image_store
 
@@ -159,10 +168,6 @@ CONFIG_PARAMETERS: dict[str, dict] = {
     },
 }
 
-CONFIG_DEFAULTS: dict[str, str] = {
-    name: spec["default"] for name, spec in CONFIG_PARAMETERS.items()
-}
-
 
 # ── Azure OpenAI clients ──────────────────────────────────────────────────────
 # The chat model (orchestration + helper LLM calls) is fixed via env; the
@@ -191,7 +196,8 @@ class AgentDeps:
 
     *config* is the resolved ``CONFIG_PARAMETERS`` snapshot for this turn
     (``{"model": ..., "size": ..., "style": ...}``), recovered from prior
-    ``/set`` commands by :func:`_resolve_config_from_history`.
+    ``/set`` commands by
+    :func:`fast_a2a_app.server.commons.config.resolve_config_from_history`.
     *available_images* lists URLs the agent can pass to ``generate_image``
     as ``reference_image_url`` (current-turn uploads + the most recent
     conversation image, both pre-stored in image_store so the agent can
@@ -204,7 +210,7 @@ class AgentDeps:
     generated: list[Artifact] = field(default_factory=list)
 
 
-SYSTEM_PROMPT = """You are an expert visual director helping the user create
+SYSTEM_PROMPT = f"""You are an expert visual director helping the user create
 and iterate on images. Use the tools available to plan and execute their
 request.
 
@@ -238,21 +244,11 @@ Workflow:
 5. For multi-step plans ("three variations" or "combine the packshot
    with my logo"), call ``generate_image`` multiple times in sequence.
 
-Active settings:
-- Every user message ends with an "Active settings:" block listing the
-  conversation-scoped parameters the user has selected via ``/set``
-  (``model``, ``size``, ``style``). These are passed *automatically* to
-  ``generate_image`` via tool deps — do NOT restate them inside the
-  ``prompt`` argument and do NOT call ``rewrite_prompt`` / ``expand_intent``
-  to inject them. They will be applied to every generated image.
-- When the active ``style`` is non-default, briefly acknowledge it in
-  your reply ("rendered in the active anime style"). Same for
-  non-default ``size`` ("in portrait orientation").
-- If the user explicitly asks for a different style/size in their
-  message ("make this one square", "try it in watercolour"), follow the
-  request for that turn without changing the persistent setting — and
-  end your reply by suggesting ``/set <param> <value>`` if they want it
-  to stick.
+{ACTIVE_SETTINGS_CONVENTION}
+- The active ``model``, ``size``, and ``style`` are passed to
+  ``generate_image`` via tool deps. Do NOT call ``rewrite_prompt`` /
+  ``expand_intent`` to inject them — they are applied to every
+  generated image regardless.
 
 Reply guidelines:
 - Be concise — the image speaks for itself; one or two sentences are
@@ -537,117 +533,40 @@ def _ext_for_mime(mime: str) -> str:
     return "png"
 
 
-# ── Input parsing (current-turn message parts) ────────────────────────────────
-# Read the user's *just-typed* message — text + image references — directly
-# from ``context.message.parts`` so slash-command detection and the
-# image-without-text guard see the untouched current turn.
-
-
-def _resolve_image_part(part: object) -> tuple[bytes, str] | None:
-    """Resolve a Part to ``(bytes, mime)`` for image content, or None.
-
-    Single resolver so callers don't have to know whether an image arrived
-    inline (fresh upload, ``raw`` part) or as a reference back into
-    image_store (prior-turn artifact, ``url`` part).
-    """
-    kind = part.WhichOneof("content")
-    if kind == "raw":
-        mime = part.media_type or "application/octet-stream"
-        if mime.startswith("image/") and part.raw:
-            return bytes(part.raw), mime
-    elif kind == "url":
-        image_id = image_store.id_from_url(part.url or "")
-        if image_id:
-            return image_store.get(image_id)
-    return None
-
-
-def _extract_input(context: RequestContext) -> tuple[str, list[tuple[bytes, str]]]:
-    """Pull the *raw* current user input + image references.
-
-    Reads from ``context.message.parts`` directly (not the prompt-builder
-    output), so slash-command detection and the "image without text"
-    guard see what the user actually typed — uncontaminated by the
-    history prefix the default prompt builder prepends.
-    """
-    text_chunks: list[str] = []
-    images: list[tuple[bytes, str]] = []
-    for part in getattr(context.message, "parts", None) or []:
-        kind = part.WhichOneof("content")
-        if kind == "text":
-            if part.text:
-                text_chunks.append(part.text)
-        elif kind in ("raw", "url"):
-            resolved = _resolve_image_part(part)
-            if resolved:
-                images.append(resolved)
-    return ("\n".join(text_chunks)).strip(), images
-
-
-# ── Conversation history ──────────────────────────────────────────────────────
-# Read *prior* turns from ``context.related_tasks`` — the active image model,
-# the most recent visible image (for "make it warmer" follow-ups), and a
-# pydantic-ai ``ModelMessage`` history so the orchestrator carries style
-# decisions across turns.
+# ── Input parsing + history file lookup ───────────────────────────────────────
+# Thin adapters that wire ``image_store`` and the "images only" filter into
+# the framework-provided walkers from ``fast_a2a_app.server.commons.uploads``.
+# ``_extract_input`` reads the current turn (slash-command detection sees the
+# untouched user message); ``_latest_image_in_history`` walks prior turns so
+# follow-ups like "make it warmer" pick up whatever is visually most recent.
 
 
 _HISTORY_MAX_MESSAGES = 12  # ≈6 turns, enough for style preferences to land
 
 
+def _resolve_image_url(url: str) -> tuple[bytes, str] | None:
+    """Adapter from ``image_store`` to the commons.uploads ``Resolver`` shape."""
+    image_id = image_store.id_from_url(url)
+    return image_store.get(image_id) if image_id else None
+
+
+def _is_image(_data: bytes, mime: str) -> bool:
+    """Predicate keeping only image parts (raw uploads carry any MIME)."""
+    return mime.startswith("image/")
+
+
+def _extract_input(context: RequestContext) -> tuple[str, list[tuple[bytes, str]]]:
+    """Current-turn user text + attached images, via commons.uploads."""
+    return extract_current_turn(
+        context, resolver=_resolve_image_url, predicate=_is_image,
+    )
+
+
 def _latest_image_in_history(context: RequestContext) -> tuple[bytes, str] | None:
-    """Most recent image in the conversation — user upload or agent output.
-
-    Walks both message ``history`` (uploads) and ``artifacts`` (generations)
-    in chronological order so prompts like "make it warmer" pick up
-    whatever is visually most recent, regardless of source.
-    """
-    related = getattr(context, "related_tasks", None) or []
-    latest: tuple[bytes, str] | None = None
-    for task in related:
-        for msg in getattr(task, "history", None) or []:
-            for part in getattr(msg, "parts", None) or []:
-                resolved = _resolve_image_part(part)
-                if resolved:
-                    latest = resolved
-        for artifact in getattr(task, "artifacts", None) or []:
-            for part in getattr(artifact, "parts", None) or []:
-                resolved = _resolve_image_part(part)
-                if resolved:
-                    latest = resolved
-    return latest
-
-
-def _resolve_config_from_history(context: RequestContext) -> dict[str, str]:
-    """Walk related-task history for ``/set <param> <value>`` commands.
-
-    Latest valid assignment wins per parameter. Unset parameters fall back to
-    ``CONFIG_PARAMETERS[<name>]["default"]``. A2A history is already persisted
-    by fast_a2a_app, so deriving config from past ``/set`` commands avoids a
-    second persistence layer just for these preferences. Matching is
-    case-insensitive — the parameter name is normalised to lowercase, the
-    value is preserved as-typed.
-    """
-    config = dict(CONFIG_DEFAULTS)
-    related = getattr(context, "related_tasks", None) or []
-    for task in related:
-        for msg in getattr(task, "history", None) or []:
-            if getattr(msg, "role", 0) != Role.ROLE_USER:
-                continue
-            for part in getattr(msg, "parts", None) or []:
-                if part.WhichOneof("content") != "text":
-                    continue
-                match = _SET_CMD.match(part.text.strip())
-                if not match:
-                    continue
-                param = (match.group(1) or "").lower()
-                value = match.group(2) or ""
-                if (
-                    param in CONFIG_PARAMETERS
-                    and value
-                    and value in CONFIG_PARAMETERS[param]["values"]
-                ):
-                    config[param] = value
-    return config
+    """Most recent image across prior turns (user uploads + agent artifacts)."""
+    return latest_file_in_history(
+        context, resolver=_resolve_image_url, predicate=_is_image,
+    )
 
 
 def _build_message_history(context: RequestContext) -> list[ModelMessage]:
@@ -722,21 +641,9 @@ def _build_message_history(context: RequestContext) -> list[ModelMessage]:
 
 # ── Slash commands ────────────────────────────────────────────────────────────
 # Deterministic UI shortcuts (``/hello``, ``/help``, ``/set``) that bypass the
-# agent loop. Slash-command parsing is case-insensitive throughout, but every
-# pill, docstring, and message uses lowercase. ``/set`` is a two-step wizard
-# backed by ``CONFIG_PARAMETERS``:
-#
-#   /set                  → pills: one per parameter name + cancel
-#   /set <param>          → pills: one per allowed value + cancel
-#   /set <param> <value>  → confirmation (assignment is recovered from
-#                           history on the next turn by
-#                           :func:`_resolve_config_from_history`)
-#   /set cancel           → acknowledged at either step, no state change
-
-
-# Matches ``/set``, ``/set <param>``, and ``/set <param> <value>``. Input is
-# case-insensitive; the handler lowercases the captured parameter name.
-_SET_CMD = re.compile(r"^/set(?:\s+(\S+))?(?:\s+(\S+))?\s*$", re.IGNORECASE)
+# agent loop. ``/hello`` and ``/help`` are app-specific; ``/set`` delegates to
+# :func:`fast_a2a_app.server.commons.config.handle_set_command`, which owns the
+# two-step pill wizard backed by ``CONFIG_PARAMETERS``.
 
 
 def _format_config_summary(config: dict[str, str]) -> str:
@@ -781,43 +688,6 @@ def _help_text(config: dict[str, str]) -> str:
     )
 
 
-def _set_step1_artifact(config: dict[str, str]) -> Artifact:
-    """``/set`` reply: one pill per parameter name + cancel."""
-    suggestions = [
-        {
-            "label": f"{name} (now: {config[name]})",
-            "prompt": f"/set {name}",
-        }
-        for name in CONFIG_PARAMETERS
-    ]
-    suggestions.append({"label": "cancel", "prompt": "/set cancel"})
-    return prompt_suggestions_artifact(
-        suggestions,
-        text="**Which parameter do you want to change?**",
-    )
-
-
-def _set_step2_artifact(param: str, config: dict[str, str]) -> Artifact:
-    """``/set <param>`` reply: one pill per allowed value + cancel."""
-    spec = CONFIG_PARAMETERS[param]
-    current = config[param]
-    suggestions = [
-        {
-            "label": f"{value}{' ✓' if value == current else ''}",
-            "prompt": f"/set {param} {value}",
-        }
-        for value in spec["values"]
-    ]
-    suggestions.append({"label": "cancel", "prompt": "/set cancel"})
-
-    lines = [f"**Choose a value for `{param}`** — {spec['description']}", ""]
-    for value, blurb in spec["values"].items():
-        marker = "✅" if value == current else "•"
-        suffix = "  *(default)*" if value == spec["default"] else ""
-        lines.append(f"{marker} `{value}`{suffix} — {blurb}")
-    return prompt_suggestions_artifact(suggestions, text="\n".join(lines))
-
-
 def _handle_slash_command(user_text: str, config: dict[str, str]) -> Artifact | None:
     """Bypass the agent loop for deterministic UI shortcuts.
 
@@ -835,43 +705,7 @@ def _handle_slash_command(user_text: str, config: dict[str, str]) -> Artifact | 
         return text_artifact(_hello_text(config))
     if lowered == "/help":
         return text_artifact(_help_text(config))
-
-    cmd = _SET_CMD.match(user_text)
-    if not cmd:
-        return None
-
-    param = (cmd.group(1) or "").lower()
-    value = cmd.group(2) or ""
-
-    # /set — step 1: pick a parameter.
-    if not param:
-        return _set_step1_artifact(config)
-
-    # cancel pill clicked at either step.
-    if param == "cancel":
-        return text_artifact("Cancelled — no parameters changed.")
-
-    if param not in CONFIG_PARAMETERS:
-        allowed = ", ".join(f"`{p}`" for p in CONFIG_PARAMETERS)
-        return text_artifact(
-            f"Unknown parameter `{param}`. Valid parameters: {allowed}.\n\n"
-            "Type `/set` to pick one."
-        )
-
-    # /set <param> — step 2: pick a value.
-    if not value:
-        return _set_step2_artifact(param, config)
-
-    # /set <param> <value> — assignment.
-    if value not in CONFIG_PARAMETERS[param]["values"]:
-        allowed = ", ".join(f"`{v}`" for v in CONFIG_PARAMETERS[param]["values"])
-        return text_artifact(
-            f"Unknown value `{value}` for `{param}`. Valid values: {allowed}.\n\n"
-            f"Type `/set {param}` to pick one."
-        )
-    return text_artifact(
-        f"✅ `{param}` set to `{value}` for this conversation."
-    )
+    return handle_set_command(user_text, config, CONFIG_PARAMETERS)
 
 
 # ── Prompt-suggestion lists ───────────────────────────────────────────────────
@@ -978,25 +812,18 @@ def _prepare_run(
         available_images=available_images,
     )
 
-    # Build a per-turn preamble listing the active /set parameters so the
+    # The active /set parameters are appended to the user prompt so the
     # orchestrator LLM is aware of them — without this, the model has no
     # context that the user has explicitly chosen a style or size, and
     # produces replies that ignore the active settings. The values are
     # *also* passed directly to ``generate_image`` via ``ctx.deps.config``,
     # so the model never has to forward them as tool arguments.
-    settings_lines = [
-        f"- {name}: {config[name]}"
-        + (" (default)" if config[name] == CONFIG_PARAMETERS[name]["default"] else "")
-        for name in CONFIG_PARAMETERS
-    ]
-    settings_block = "Active settings:\n" + "\n".join(settings_lines)
-
     sections: list[str] = []
     if available_images:
         ref_lines = [f"- {url} ({label})" for url, label in available_images]
         sections.append("Available references:\n" + "\n".join(ref_lines))
     sections.append("User: " + user_text)
-    sections.append(settings_block)
+    sections.append(format_active_settings(config, CONFIG_PARAMETERS))
     prompt_with_refs = "\n\n".join(sections)
 
     return deps, prompt_with_refs
@@ -1055,7 +882,7 @@ async def invoke(prompt: str, context: RequestContext) -> Artifact:
     in how they return the result — one Artifact vs. multiple yields.
     """  # noqa: ARG001 — prompt is part of the framework contract
     user_text, attached_images = _extract_input(context)
-    config = _resolve_config_from_history(context)
+    config = resolve_config_from_history(context, CONFIG_PARAMETERS)
 
     if response := _handle_slash_command(user_text, config):
         return response
@@ -1099,7 +926,7 @@ async def stream_invoke(
     immediate feedback as each ``generate_image`` call completes.
     """  # noqa: ARG001
     user_text, attached_images = _extract_input(context)
-    config = _resolve_config_from_history(context)
+    config = resolve_config_from_history(context, CONFIG_PARAMETERS)
 
     if response := _handle_slash_command(user_text, config):
         yield response

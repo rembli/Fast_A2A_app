@@ -162,6 +162,8 @@ async def stream_invoke(prompt: str, context: RequestContext):
 
 Why read parts directly? The default prompt builder concatenates history + user text into one string for the LLM. Slash commands and file URLs would get drowned in that — they're routing decisions, not LLM input. Reading `context.message.parts` gives you the **untouched** current turn.
 
+If you just need `(text, files)` from the current turn — text-or-image agent, document-question agent, etc. — skip the manual walk and use [`extract_current_turn`](../src/fast_a2a_app/server/commons/uploads.py) from `commons.uploads`. It handles the `raw` / `url` switch, takes an optional resolver for URL refs, and an optional MIME predicate to filter. See [§File attachments → Reading uploads in your agent](#reading-uploads-in-your-agent) for the wiring.
+
 ### Pattern 2 — key external state by `context_id`
 
 ```python
@@ -225,7 +227,7 @@ def latest_table_in_history(context: RequestContext) -> dict | None:
     return latest
 ```
 
-The `image-creator` example uses the same shape to find the most recent image so "*make it warmer*" picks up the right reference without re-uploading.
+The `image-creator` example uses the same shape to find the most recent image so "*make it warmer*" picks up the right reference without re-uploading — but it goes through [`latest_file_in_history`](../src/fast_a2a_app/server/commons/uploads.py) from `commons.uploads`, which already walks both `task.history` (user uploads) and `task.artifacts` (agent-produced files) with a resolver + predicate. Reach for the helper for `raw`/`url` file parts; keep the manual walk above for custom `data` shapes the helpers don't know about.
 
 > Tip — when you both **read raw input** and **build history**, set `history_max_lines=0` so the default builder stays out of the way; you're now driving prompt construction yourself.
 
@@ -362,7 +364,7 @@ The status appears in the working-state indicator in the UI until the next statu
 
 ## Configurable parameters via `/set`
 
-When you want the user to switch knobs at runtime (which model, output size, output style, verbosity, …) without redeploying, declare a **single schema dict** in `agent.py`, drive a two-step slash-command wizard from it, and re-derive the active values from the conversation history each turn. No server-side store, no env-var-restart cycle, no duplicate truth.
+When you want the user to switch knobs at runtime (which model, output size, output style, verbosity, …) without redeploying, declare a **single schema dict** in `agent.py`, hand it to the helpers in [`fast_a2a_app.server.commons.config`](../src/fast_a2a_app/server/commons/config.py), and call them from `stream_invoke`. The active values are recovered from A2A history each turn — no server-side store, no env-var-restart cycle, no duplicate truth.
 
 Implemented end-to-end in [examples/image-creator/agent.py](../examples/image-creator/agent.py) and [examples/image-creator/main.py](../examples/image-creator/main.py).
 
@@ -389,11 +391,9 @@ CONFIG_PARAMETERS: dict[str, dict] = {
         },
     },
 }
-
-CONFIG_DEFAULTS = {name: spec["default"] for name, spec in CONFIG_PARAMETERS.items()}
 ```
 
-Keep the schema next to the code that reads it — defaults, value enums, slash-command handler, and the tool that consumes the resolved values all live in one file.
+Keep the schema next to the code that reads it — the helpers, the tool that consumes the resolved values, and the LLM-facing system prompt all live in `agent.py`.
 
 ### 2. Expose the schema at `GET /config`
 
@@ -408,91 +408,24 @@ async def get_config() -> dict:
 
 The endpoint serves the schema verbatim — no transformation. Admin UIs, monitoring, and the chat UI itself can discover what `/set` can switch.
 
-### 3. Drive a two-step pill wizard from the same schema
+### 3. Wire `commons.config` into `stream_invoke`
+
+Three function calls + one constant cover the whole pattern. The helpers ship in [`fast_a2a_app.server.commons.config`](../src/fast_a2a_app/server/commons/config.py) and are framework-agnostic — they read from `RequestContext` and return `Artifact` / `dict[str, str]` / `str`, nothing else.
 
 ```python
-# agent.py — case-insensitive parsing, lowercase replies by convention
-_SET_CMD = re.compile(r"^/set(?:\s+(\S+))?(?:\s+(\S+))?\s*$", re.IGNORECASE)
+# agent.py
+from fast_a2a_app import build_stream_invoke, text_artifact
+from fast_a2a_app.server.commons.config import (
+    ACTIVE_SETTINGS_CONVENTION,
+    format_active_settings,
+    handle_set_command,
+    resolve_config_from_history,
+)
 
-def _handle_set_command(user_text: str, config: dict[str, str]) -> Artifact | None:
-    cmd = _SET_CMD.match(user_text)
-    if not cmd:
-        return None
-    param = (cmd.group(1) or "").lower()
-    value = cmd.group(2) or ""
-
-    if not param:                                  # /set → step 1
-        suggestions = [
-            {"label": f"{n} (now: {config[n]})", "prompt": f"/set {n}"}
-            for n in CONFIG_PARAMETERS
-        ] + [{"label": "cancel", "prompt": "/set cancel"}]
-        return prompt_suggestions_artifact(suggestions, text="**Which parameter?**")
-
-    if param == "cancel":
-        return text_artifact("Cancelled — no parameters changed.")
-
-    if param not in CONFIG_PARAMETERS:
-        return text_artifact(f"Unknown parameter `{param}`.")
-
-    if not value:                                  # /set <param> → step 2
-        spec = CONFIG_PARAMETERS[param]
-        suggestions = [
-            {"label": v, "prompt": f"/set {param} {v}"}
-            for v in spec["values"]
-        ] + [{"label": "cancel", "prompt": "/set cancel"}]
-        return prompt_suggestions_artifact(
-            suggestions,
-            text=f"**Choose a value for `{param}`** — {spec['description']}",
-        )
-
-    if value not in CONFIG_PARAMETERS[param]["values"]:
-        return text_artifact(f"Unknown value `{value}` for `{param}`.")
-
-    return text_artifact(f"✅ `{param}` set to `{value}` for this conversation.")
-```
-
-Each step's reply is a `prompt_suggestions_artifact` whose pills carry **the next command** in their `prompt` field — clicking advances the wizard.
-
-### 4. Recover the active values from history each turn
-
-```python
-def _resolve_config_from_history(context: RequestContext) -> dict[str, str]:
-    """Walk related-task history for /set <param> <value> commands.
-    Latest valid assignment wins per parameter; unset parameters fall back
-    to CONFIG_PARAMETERS[<name>]["default"]."""
-    config = dict(CONFIG_DEFAULTS)
-    for task in getattr(context, "related_tasks", None) or []:
-        for msg in getattr(task, "history", None) or []:
-            if getattr(msg, "role", 0) != Role.ROLE_USER:
-                continue
-            for part in getattr(msg, "parts", None) or []:
-                if part.WhichOneof("content") != "text":
-                    continue
-                m = _SET_CMD.match(part.text.strip())
-                if not m:
-                    continue
-                param = (m.group(1) or "").lower()
-                value = m.group(2) or ""
-                if (
-                    param in CONFIG_PARAMETERS
-                    and value
-                    and value in CONFIG_PARAMETERS[param]["values"]
-                ):
-                    config[param] = value
-    return config
-```
-
-A2A history is already persisted by `fast_a2a_app` (in `MemoryTaskStore` / Redis / Mongo / Postgres). Deriving config from past `/set` commands avoids introducing a second persistence layer for what is effectively cached user input — and survives reloads, multi-process deployments, and process restarts for free.
-
-### 5. Use the resolved config inside your tools (direct path)
-
-The values reach the tools without going through the LLM — pass them via `RunContext` deps so the orchestrator never has to forward them as tool arguments.
-
-```python
-@dataclass
-class AgentDeps:
-    config: dict[str, str]
-    # …
+SYSTEM_PROMPT = (
+    "You are a concise image-creation agent.\n\n"
+    + ACTIVE_SETTINGS_CONVENTION
+)
 
 @my_agent.tool
 async def generate_image(ctx: RunContext[AgentDeps], prompt: str) -> str:
@@ -500,54 +433,56 @@ async def generate_image(ctx: RunContext[AgentDeps], prompt: str) -> str:
     size  = ctx.deps.config["size"]
     style = ctx.deps.config["style"]
     # … pass them to the underlying API call.
-```
 
-### 6. Tell the orchestrator about the active settings (LLM path)
+async def stream_invoke(prompt: str, context: RequestContext):
+    user_text = context.get_user_input()
+    config    = resolve_config_from_history(context, CONFIG_PARAMETERS)
 
-This step is easy to miss — and on its own, step 5 is **not enough**. The values reach `generate_image` correctly, but the orchestrator LLM has no idea what the active `model` / `size` / `style` are, so its textual replies ignore them and it may re-state them inside the tool prompt anyway.
-
-Prepend an `Active settings:` block to the prompt fed into `agent.run()`, *in addition* to the deps wiring:
-
-```python
-async def stream_invoke(prompt, context):
-    config = _resolve_config_from_history(context)
-    if reply := _handle_slash_command(user_text, config):
-        yield reply
+    if reply := handle_set_command(user_text, config, CONFIG_PARAMETERS):
+        yield reply           # /set wizard short-circuits the agent loop
         return
 
-    settings_lines = [
-        f"- {name}: {config[name]}"
-        + (" (default)" if config[name] == CONFIG_PARAMETERS[name]["default"] else "")
-        for name in CONFIG_PARAMETERS
-    ]
-    prompt_with_settings = f"User: {user_text}\n\nActive settings:\n" + "\n".join(settings_lines)
-
-    deps = AgentDeps(config=config, …)
-    result = await my_agent.run(prompt_with_settings, deps=deps, …)
+    prompt_ext = f"{prompt}\n\n{format_active_settings(config, CONFIG_PARAMETERS)}"
+    deps = AgentDeps(config=config)
+    result = await my_agent.run(prompt_ext, deps=deps)
+    yield text_artifact(str(result.output))
 ```
 
-And tell the orchestrator how to behave with this preamble in the system prompt:
+What each piece does:
 
-```text
-Active settings:
-- Every user message ends with an "Active settings:" block listing the
-  conversation-scoped parameters (model, size, style). These are passed
-  AUTOMATICALLY to generate_image via tool deps — do NOT restate them
-  inside the prompt argument.
-- When the active style is non-default, briefly acknowledge it in your
-  reply ("rendered in the active anime style"). Same for non-default size.
-- If the user asks for a one-off override in their message, follow it
-  without changing the persistent setting — and end the reply by
-  suggesting `/set <param> <value>` if they want it to stick.
+| Helper | Purpose |
+|---|---|
+| `resolve_config_from_history(context, schema)` | Walks `context.related_tasks` for past `/set <param> <value>` user messages and returns the resolved snapshot. Unset parameters fall back to `schema[<name>]["default"]`. Latest valid assignment wins. |
+| `handle_set_command(user_text, config, schema)` | Returns a wizard reply Artifact when `user_text` matches `/set …` (step-1 pills, step-2 pills, validation errors, or the confirmation message). Returns `None` for non-`/set` text — caller falls through. |
+| `format_active_settings(config, schema)` | Renders the resolved dict as the `Active settings:\n- name: value` block to append to the user prompt. Values that match `schema[<name>]["default"]` are tagged `(default)`. |
+| `ACTIVE_SETTINGS_CONVENTION` | Drop-in preamble for your system prompt explaining the convention to the orchestrator LLM so it doesn't restate the settings inside tool arguments or ignore non-default values in its replies. |
+
+### Why both `deps` and `format_active_settings` are needed
+
+The deps wiring (`AgentDeps(config=config)`) gets the values to your tools — `ctx.deps.config["model"]` reaches the API call directly, without ever passing through the LLM.
+
+The `format_active_settings` block is what tells the orchestrator LLM that the settings exist. Skip it and the tool will still receive the right `model` / `size` / `style`, but the agent's textual reply will pretend nothing changed (it has no idea the user typed `/set style anime` two turns ago).
+
+`ACTIVE_SETTINGS_CONVENTION` is the system-prompt counterpart — it teaches the LLM how to behave with the trailing block ("don't restate these in tool args", "acknowledge non-default values briefly", "suggest `/set` for one-off overrides").
+
+### Adding app-specific slash commands
+
+`handle_set_command` only handles `/set`. If your agent ships extra commands (`/help`, `/clear`, …), keep them in user code and call `handle_set_command` as a fall-through:
+
+```python
+def _handle_slash_command(user_text, config):
+    if user_text.lower() == "/help":
+        return text_artifact(HELP_TEXT)
+    return handle_set_command(user_text, config, CONFIG_PARAMETERS)
 ```
 
 ### Why this shape
 
-- **Single source of truth.** Adding a parameter or a value is a one-line edit to `CONFIG_PARAMETERS`. The `/set` pills, `GET /config` payload, validation, and confirmation messages all pick it up automatically.
-- **No server-side state.** The history walker is idempotent; turns are reproducible from the transcript alone. Works the same in single-process memory and multi-process Redis/Mongo/Postgres deployments.
-- **Catalog-only by design.** Unknown parameter names and unknown values are rejected with a recovery hint. The model in `generate_image` only ever sees values that are in the enum.
+- **Single source of truth.** Adding a parameter or a value is a one-line edit to `CONFIG_PARAMETERS`. The `/set` pills, `GET /config` payload, validation, confirmation messages, and the `Active settings:` block all pick it up automatically.
+- **No server-side state.** History-derived config is idempotent; turns are reproducible from the transcript alone. Works the same in single-process memory and multi-process Redis/Mongo/Postgres deployments.
+- **Catalog-only by design.** Unknown parameter names and unknown values are rejected by `handle_set_command` with a recovery hint. Tools only ever see values that are in the enum.
 - **Case-insensitive in, lowercase out.** `/SET Model gpt-image-1`, `/Set MODEL gpt-image-1`, and `/set model gpt-image-1` all behave the same; pills and docs use lowercase by convention so the surface reads consistently.
-- **Both wiring paths matter.** Tool deps (step 5) make sure the API receives the right values. The system-prompt preamble (step 6) makes sure the LLM's replies acknowledge them. Skip step 6 and the user's `/set style anime` will be honoured by `generate_image` but the agent's text reply will pretend nothing changed.
+- **Both wiring paths still matter.** `ctx.deps.config` makes sure the API receives the right values. `format_active_settings` + `ACTIVE_SETTINGS_CONVENTION` make sure the LLM's replies acknowledge them. Skip either and the behaviour drifts in a way that's hard to diagnose later.
 
 ---
 
@@ -602,6 +537,49 @@ app.mount("/", build_a2a_ui(
 ```
 
 A list is joined into a comma-separated string for you; a string passes through unchanged so you can paste a pre-formatted `accept=` value if you already have one. The picker's allowlist is **UX, not security** — always validate the `Content-Type` and size in your upload endpoint anyway.
+
+### Reading uploads in your agent
+
+Uploads reach your `invoke` / `stream_invoke` as parts on `context.message.parts`. Fresh uploads arrive **inline** as `raw` parts (bytes ride along with the message); follow-up turns that reference a prior file arrive as `url` parts (the UI re-sends the URL, you fetch the bytes from your store). Every non-trivial agent ends up writing the same walker over both cases plus another over `context.related_tasks` for "edit the thing I sent two turns ago" — so [`fast_a2a_app.server.commons.uploads`](../src/fast_a2a_app/server/commons/uploads.py) ships the three pieces.
+
+```python
+from fast_a2a_app.server.commons.uploads import (
+    extract_current_turn,        # walks context.message.parts → (text, files)
+    latest_file_in_history,      # walks context.related_tasks → most recent file
+)
+
+# Adapter from YOUR store to the resolver shape: url → (bytes, mime) | None.
+def _resolve_url(url: str):
+    blob_id = my_store.id_from_url(url)
+    return my_store.get(blob_id) if blob_id else None
+
+# Optional predicate — keeps only the file kinds your agent cares about.
+def _is_image(_data, mime):
+    return mime.startswith("image/")
+
+async def stream_invoke(prompt: str, context: RequestContext):
+    user_text, uploads = extract_current_turn(
+        context, resolver=_resolve_url, predicate=_is_image,
+    )
+    # "make it warmer" with no fresh upload → fall back to whatever the
+    # conversation last surfaced (user upload OR agent-produced image).
+    previous = latest_file_in_history(
+        context, resolver=_resolve_url, predicate=_is_image,
+    ) if not uploads else None
+    ...
+```
+
+What each piece does:
+
+| Helper | Returns | Walks |
+|---|---|---|
+| `resolve_file_part(part, resolver=…)` | `(bytes, mime) \| None` | A single A2A `Part` — `raw` inline, `url` via your resolver, anything else → None. |
+| `extract_current_turn(context, resolver=…, predicate=…)` | `(text, [(bytes, mime), …])` | `context.message.parts` — the **untouched current turn**, ideal for slash-command routing and per-turn upload handling. |
+| `latest_file_in_history(context, resolver=…, predicate=…)` | `(bytes, mime) \| None` | `context.related_tasks` — both user-side message history and agent-side artifacts. Last match wins. |
+
+Why a resolver callable and not a built-in store: every team's storage is different (S3, Bynder, Frontify, local disk), and the framework already makes `POST /uploads` opt-in. Commons stays storage-agnostic — you wire it to whatever backend the rest of your app uses by passing a 4-line adapter.
+
+The image-creator example wires `image_store` (a local file-backed store next to `agent.py`) into both helpers — see [examples/image-creator/agent.py](../examples/image-creator/agent.py).
 
 ---
 
