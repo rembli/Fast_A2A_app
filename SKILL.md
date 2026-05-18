@@ -24,6 +24,29 @@ Skip for: unrelated FastAPI work, plain LLM scripts with no chat surface, A2A *c
 
 ---
 
+## Before you scaffold — gather requirements
+
+Don't open `agent.py` until the shape of the project is decided. The task store, history strategy, UI surface, and file-routing logic all fall out of a handful of upfront answers — guessing wrong means rewrites later. **Always propose a sensible default**, then let the user override with their own values. Bundle related questions through `AskUserQuestion` rather than firing all of them at once.
+
+| # | Ask the user | Drives | Default to suggest |
+|---|---|---|---|
+| 1 | **Purpose & audience?** One sentence. | `AgentCard.description`, `AgentSkill` list, system prompt | — (must ask) |
+| 2 | **Streaming or single-shot?** | `stream_invoke` vs `invoke`, `capabilities.streaming` | Streaming for any LLM-backed or tool-using agent |
+| 3 | **Model / provider?** Azure OpenAI, OpenAI, Anthropic, local, …? | model client wiring; pydantic-ai vs raw SDK | Azure OpenAI + pydantic-ai unless the user has a constraint |
+| 4 | **File uploads?** Which media types (CSV, image, PDF, none)? | `file_upload_api=`, `accepted_file_types=`, `extract_current_turn` — see [§File attachments](docs/how-to.md#file-attachments) | Off; opt in only when the use case needs it |
+| 5 | **Runtime-configurable parameters?** Knobs to switch via chat (model variant, output size, style, verbosity, …)? | `CONFIG_PARAMETERS` + `/set` — see [§Configurable parameters via /set](docs/how-to.md#configurable-parameters-via-set) | Propose 2–3 parameters that fit the use case |
+| 6 | **Multi-turn / HITL?** plan → approve → execute? | `workflow.py` split, same-turn guard, dedicated state prefix | Plain single-turn unless the user describes an approval flow |
+| 7 | **Durable / crash-safe execution?** Must in-flight turns survive a restart? | `DBOSAgent` + Postgres — see [§Durable agent execution with DBOS](docs/how-to.md#durable-agent-execution-with-dbos) | Off; turn on for runs >30 s, expensive tool chains, or paid side-effects |
+| 8 | **Task store?** Single-process or multi-process / cross-instance cancel? | `MemoryTaskStore` vs `Redis` / `Mongo` / `Postgres` — see [§Choosing a task store](docs/how-to.md#choosing-a-task-store) | **DBOS on → Postgres (mandatory).** Otherwise: `Memory` for dev; ask the user to pick `Redis` / `Mongo` / `Memory` for prod |
+| 9 | **Custom UI widgets?** Anything beyond `TEXT` / `TABLE` / `MAP` / images / files / `PROMPT_SUGGESTIONS`? | new `<TAG>.py` + `<TAG>.js` pair — see [§Adding a new typed widget](docs/how-to.md#adding-a-new-typed-widget) | Reuse existing widgets; only add a custom one for a genuinely novel shape |
+| 10 | **Conversation history strategy?** | `history_max_lines` + optional `_build_message_history` adapter — see [§Using the RequestContext](docs/how-to.md#using-the-requestcontext) | pydantic-ai → `history_max_lines=0` + adapter; raw SDK → default 12-line prefix |
+
+The list above is the common set — extra questions (auth, observability, rate-limits, cost ceilings) may surface from the brief. If the user gives a vague one-liner ("a CSV chatbot"), propose a fully-defaulted plan and confirm before writing code.
+
+**Hard rule:** when durable execution is required, `task_store` is locked to `PostgresTaskStore` — one Postgres covers both DBOS and the A2A store. Don't offer Redis / Mongo / Memory in that case.
+
+---
+
 ## The agent.py contract
 
 Every agent exports **two top-level names**:
@@ -415,4 +438,4 @@ In-repo, ordered by complexity:
 
 In-repo examples share the parent project's `pyproject.toml` — run `poetry install` at the repo root, then `cd examples/<name> && poetry run uvicorn main:app --reload`.
 
-Decide simple vs. multi-turn from the user's prompt, lean on pydantic-ai for anything non-trivial, produce `agent.py` + `main.py` end-to-end, and verify against the checklist.
+Gather requirements first (see § Before you scaffold), lean on pydantic-ai for anything non-trivial, produce `agent.py` + `main.py` end-to-end, and verify against the checklist.
