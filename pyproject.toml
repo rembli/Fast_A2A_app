@@ -1,6 +1,6 @@
 [project]
 name = "fast_a2a_app"
-version = "0.6.9"
+version = "0.6.10"
 description = "fast_a2a_app — Drop-in A2A server and chat UI for any AI agent"
 authors = [
     {name = "Georg Boegerl", email = "georg.boegerl@web.de"},

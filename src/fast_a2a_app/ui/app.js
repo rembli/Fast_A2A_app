@@ -550,11 +550,20 @@ function processStreamPayload(payload, streamState, thinkEl) {
     // sibling — which is exactly how images attached to a captioned
     // ``image_artifact`` used to disappear from the live view.
     if (!upd.append && (hasRich || !artifactText)) {
-      streamState.thinkEl?.remove();
       const entryId = appendTranscriptEntry('agent', artifactText, parts);
       const bubbleEl = createAgentBubble(entryId);
       renderAgentBubbleParts(bubbleEl, parts, streamState.taskId);
       streamState.streamedArtifactCount += 1;
+      // Keep the working bubble alive across rich artifacts and reposition
+      // it below the new bubble so progress messages that arrive between
+      // artifacts (e.g. heartbeat ticks during the LLM run) stay visible.
+      // Renderers that don't want a visible chat bubble (e.g. DOCUMENTS
+      // side-panel updates) hide their own wrap in their renderer body —
+      // the framework stays agnostic about that decision.
+      if (streamState.thinkEl?.isConnected) {
+        $msgs.appendChild(streamState.thinkEl);
+        scrollEnd();
+      }
 
       // If the artifact carries clickable prompt suggestions, register
       // them against the current task. The fullscreen overlay surfaces
@@ -590,10 +599,12 @@ function processStreamPayload(payload, streamState, thinkEl) {
     if (state === 'TASK_STATE_WORKING') {
       const progressText = agentStatusText(upd);
       if (progressText && !isTransientAgentText(progressText)) {
-        // A prior artifact (commonly a hidden DOCUMENTS side-panel
-        // update) may have removed the working bubble. Recreate it so
-        // ``Calling Claude…`` and subsequent heartbeat ticks remain
-        // visible during the LLM run.
+        // Safety net — the working bubble is normally kept alive across
+        // intermediate artifacts, but a streamed text reply removes it
+        // via ``ensureAgentBubble`` once the agent starts producing
+        // visible response text. If more progress ticks arrive after
+        // that (rare but possible), recreate the bubble so the user
+        // still sees activity.
         if (!streamState.thinkEl?.isConnected) {
           streamState.thinkEl = thinkingMsg();
         }
