@@ -287,7 +287,7 @@ async function runTurn(parts, thinkEl) {
       await sendNonStreaming(parts, thinkEl);
     }
   } catch (err) {
-    thinkEl.remove();
+    removeAllThinking();
     if (err.name === 'UserStop') {
       sysMsg('Task stopped.');
     } else {
@@ -344,6 +344,13 @@ async function sendAndStream(parts, thinkEl) {
     task: null,
     taskId: null,
     streamedArtifactCount: 0,
+    // ``thinkEl`` is tracked in streamState so progress handlers can
+    // recreate it after a hidden artifact (e.g. a DOCUMENTS side-panel
+    // update) has removed the original from the DOM. Without this,
+    // TASK_STATE_WORKING events that arrive after such an artifact
+    // would silently no-op and the user would see a frozen UI until
+    // the LLM finally produces its real output.
+    thinkEl,
   };
 
   const sendBody = {
@@ -504,6 +511,12 @@ function findSseBoundary(buffer) {
 }
 
 function processStreamPayload(payload, streamState, thinkEl) {
+  // Resilience for callers that didn't seed streamState.thinkEl (older
+  // call sites or future re-entry paths). All thinking-bubble ops below
+  // route through streamState.thinkEl so a mid-stream replacement is
+  // visible to every later handler.
+  if (!streamState.thinkEl) streamState.thinkEl = thinkEl;
+
   const result = payload.result;
   if (!result) return;
 
@@ -537,7 +550,7 @@ function processStreamPayload(payload, streamState, thinkEl) {
     // sibling — which is exactly how images attached to a captioned
     // ``image_artifact`` used to disappear from the live view.
     if (!upd.append && (hasRich || !artifactText)) {
-      thinkEl.remove();
+      streamState.thinkEl?.remove();
       const entryId = appendTranscriptEntry('agent', artifactText, parts);
       const bubbleEl = createAgentBubble(entryId);
       renderAgentBubbleParts(bubbleEl, parts, streamState.taskId);
@@ -562,7 +575,7 @@ function processStreamPayload(payload, streamState, thinkEl) {
       streamState.streamedArtifactCount += 1;
     }
 
-    streamState.agentBubble = ensureAgentBubble(streamState.agentBubble, thinkEl);
+    streamState.agentBubble = ensureAgentBubble(streamState.agentBubble, streamState.thinkEl);
     renderAgentBubble(streamState.agentBubble, streamState.liveText);
     return;
   }
@@ -577,7 +590,14 @@ function processStreamPayload(payload, streamState, thinkEl) {
     if (state === 'TASK_STATE_WORKING') {
       const progressText = agentStatusText(upd);
       if (progressText && !isTransientAgentText(progressText)) {
-        updateThinkingText(thinkEl, progressText);
+        // A prior artifact (commonly a hidden DOCUMENTS side-panel
+        // update) may have removed the working bubble. Recreate it so
+        // ``Calling Claude…`` and subsequent heartbeat ticks remain
+        // visible during the LLM run.
+        if (!streamState.thinkEl?.isConnected) {
+          streamState.thinkEl = thinkingMsg();
+        }
+        updateThinkingText(streamState.thinkEl, progressText);
       }
       return;
     }
@@ -598,7 +618,7 @@ function processStreamPayload(payload, streamState, thinkEl) {
     }
 
     if (state === 'TASK_STATE_COMPLETED' || state === 'TASK_STATE_INPUT_REQUIRED') {
-      thinkEl.remove();
+      streamState.thinkEl?.remove();
 
       if (!streamState.streamedArtifactCount) {
         // Nothing rendered inline — render the full task as a snapshot.
@@ -651,7 +671,7 @@ function processStreamPayload(payload, streamState, thinkEl) {
     streamState.liveText = agentText;
     streamState.agentBubble = ensureAgentBubble(
       streamState.agentBubble,
-      thinkEl,
+      streamState.thinkEl,
     );
     renderAgentBubble(streamState.agentBubble, streamState.liveText);
   }
@@ -726,7 +746,7 @@ async function displayTaskSnapshot(taskId, streamState, thinkEl) {
     throw new Error('Task was canceled.');
   }
 
-  thinkEl.remove();
+  streamState.thinkEl?.remove();
   displayTaskMessages(task, streamState.agentBubble);
 
   if (state === 'TASK_STATE_COMPLETED' || state === 'TASK_STATE_INPUT_REQUIRED') {
@@ -785,13 +805,14 @@ async function resumeActiveTaskOnLoad() {
     task: null,
     taskId: activeTask.taskId,
     streamedArtifactCount: 0,
+    thinkEl,
   };
 
   try {
     await resubscribeTaskStream(streamState, thinkEl, { silent: true });
   } catch (err) {
     console.error('[a2a] resume failed:', err);
-    thinkEl.remove();
+    removeAllThinking();
     errorMsg(err.message || String(err));
   } finally {
     setBusy(false);
@@ -844,7 +865,52 @@ function loadTranscript() {
 }
 
 function saveTranscript(entries) {
-  localStorage.setItem(transcriptStorageKey(), JSON.stringify(entries));
+  // localStorage caps at ~5–10 MB per origin depending on browser. Long
+  // conversations — especially those with image/document artifacts whose
+  // ``parts`` carry data URLs or many page-thumbnail URLs — can blow
+  // past that limit and crash ``handleSend`` mid-flow. We retry with
+  // progressively older entries dropped (oldest-first) until the write
+  // succeeds, so the UI degrades to "we kept the recent history" instead
+  // of going dead.
+  const key = transcriptStorageKey();
+  let working = entries;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      localStorage.setItem(key, JSON.stringify(working));
+      if (working !== entries) {
+        const dropped = entries.length - working.length;
+        console.warn(
+          `[a2a] transcript exceeded localStorage quota — dropped ` +
+          `${dropped} oldest entr${dropped === 1 ? 'y' : 'ies'} to fit.`
+        );
+      }
+      return;
+    } catch (err) {
+      const isQuota =
+        err &&
+        (err.name === 'QuotaExceededError' ||
+         err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+         err.code === 22 || err.code === 1014);
+      if (!isQuota || working.length <= 1) throw err;
+      // Drop the oldest ~25% (at least 1 entry) and try again. Geometric
+      // backoff keeps the worst case to ~12 attempts even on a transcript
+      // that's 50× too large.
+      const drop = Math.max(1, Math.floor(working.length / 4));
+      working = working.slice(drop);
+    }
+  }
+  // Final fallback — wipe and store just the most recent entry so the
+  // conversation can keep going.
+  try {
+    localStorage.setItem(key, JSON.stringify(entries.slice(-1)));
+    console.warn(
+      '[a2a] transcript quota: pruning loop exhausted, kept only the ' +
+      'latest entry.'
+    );
+  } catch {
+    localStorage.removeItem(key);
+    console.warn('[a2a] transcript quota: cleared transcript to recover.');
+  }
 }
 
 /**
@@ -1477,6 +1543,10 @@ function updateThinkingText(thinkEl, text) {
 
 function thinkingMsg() {
   const wrap = el('div', 'flex justify-start');
+  // Marker for ``removeAllThinking()`` — error/cleanup paths use it to
+  // sweep up any working bubble (original or recreated mid-stream when
+  // a hidden artifact removed the prior one).
+  wrap.dataset.thinking = '1';
   wrap.innerHTML = `
     <div class="bg-white border border-slate-200 rounded-2xl rounded-tl-sm
                 px-4 py-3 shadow-sm text-sm text-slate-400 flex items-center gap-2">
@@ -1486,6 +1556,12 @@ function thinkingMsg() {
   $msgs.appendChild(wrap);
   scrollEnd();
   return wrap;
+}
+
+function removeAllThinking() {
+  for (const node of $msgs.querySelectorAll('[data-thinking="1"]')) {
+    node.remove();
+  }
 }
 
 function sysMsg(text, options = {}) {
@@ -1741,10 +1817,12 @@ function fileIcon(mediaType) {
   if (mediaType.includes('spreadsheet') || mediaType === 'application/vnd.ms-excel'
       || mediaType === 'text/csv' || mediaType === 'application/csv'
       || mediaType === 'text/tab-separated-values') return '📊';
-  if (mediaType.includes('json') || mediaType.includes('xml')) return '{}';
+  if (mediaType === 'application/json' || mediaType.endsWith('+json')
+      || mediaType === 'application/xml' || mediaType === 'text/xml'
+      || mediaType.endsWith('+xml')) return '{}';
   if (mediaType.includes('zip') || mediaType.includes('archive')) return '🗜';
   if (mediaType.startsWith('text/'))    return '📄';
-  return '📎';
+  return '📄';
 }
 
 /**
