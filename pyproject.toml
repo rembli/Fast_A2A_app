@@ -1,6 +1,6 @@
 [project]
 name = "fast_a2a_app"
-version = "0.6.11"
+dynamic = ["version"]
 description = "fast_a2a_app — Drop-in A2A server and chat UI for any AI agent"
 authors = [
     {name = "Georg Boegerl", email = "georg.boegerl@web.de"},
@@ -48,6 +48,9 @@ Issues = "https://github.com/rembli/fast_a2a_app/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/fast_a2a_app/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fast_a2a_app"]

@@ -22,14 +22,10 @@ in the served HTML so the bundled JS can branch on it.
 from __future__ import annotations
 
 import json
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Iterable
 
-try:
-    _LIBRARY_VERSION = _pkg_version("fast_a2a_app")
-except PackageNotFoundError:
-    _LIBRARY_VERSION = "dev"
+from .._version import __version__ as _LIBRARY_VERSION
 
 from starlette.applications import Starlette
 from starlette.requests import Request

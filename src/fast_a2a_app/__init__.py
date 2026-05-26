@@ -53,6 +53,8 @@ Call ``report_progress("step 2/5…")`` from anywhere inside your agent
 from . import _sdk_compat as _sdk_compat
 _sdk_compat.apply()
 
+from ._version import __version__
+
 from .server import (
     A2ATaskStore,
     ArtifactType,
@@ -80,8 +82,6 @@ from .server import (
     text_artifact,
 )
 from .ui import a2a_ui, build_a2a_ui
-
-__version__ = "0.6.0"
 
 __all__ = [
     # Server
