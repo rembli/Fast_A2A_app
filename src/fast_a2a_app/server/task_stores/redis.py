@@ -14,20 +14,28 @@ KEY SCHEMA
     a2a:context:{context_id}:sequence  — monotonic counter.
     a2a:cancel:{task_id}               — short-lived flag, TTL 5 min,
                                          used for cross-instance cancel signalling.
+    a2a:progress:{task_id}:log         — LIST of "{seq}|{ts}|{message}" entries,
+                                         appended on each report_progress(...).
+    a2a:progress:{task_id}:seq         — monotonic counter for the log.
+    a2a:progress:{task_id}:hb          — last-heartbeat unix seconds (string).
 """
 from __future__ import annotations
 
 import logging
+import time
 
 import redis.asyncio as aioredis
 from google.protobuf.json_format import MessageToJson, Parse
 from a2a.server.tasks import TaskStore
 from a2a.types import ListTasksRequest, ListTasksResponse, Task
 
+from ._types import ProgressEntry
+
 log = logging.getLogger(__name__)
 
 _TTL = 86_400          # 24 h
 _CANCEL_SIGNAL_TTL = 300  # 5 min
+_PROGRESS_TTL = 86_400  # 24 h — matches task TTL
 
 
 class RedisTaskStore(TaskStore):
@@ -66,6 +74,15 @@ class RedisTaskStore(TaskStore):
 
     def _context_sequence_key(self, context_id: str) -> str:
         return f"a2a:context:{context_id}:sequence"
+
+    def _progress_log_key(self, task_id: str) -> str:
+        return f"a2a:progress:{task_id}:log"
+
+    def _progress_seq_key(self, task_id: str) -> str:
+        return f"a2a:progress:{task_id}:seq"
+
+    def _progress_hb_key(self, task_id: str) -> str:
+        return f"a2a:progress:{task_id}:hb"
 
     # ── TaskStore protocol ────────────────────────────────────────────────────
 
@@ -116,11 +133,14 @@ class RedisTaskStore(TaskStore):
             return None
 
     async def delete(self, task_id: str, context=None) -> None:
-        """Remove a task and its context index entry atomically."""
+        """Remove a task, its context index entry, and its progress log atomically."""
         context_id = await self._r.get(self._task_context_key(task_id))
         async with self._r.pipeline(transaction=True) as pipe:
             pipe.delete(self._task_key(task_id))
             pipe.delete(self._task_context_key(task_id))
+            pipe.delete(self._progress_log_key(task_id))
+            pipe.delete(self._progress_seq_key(task_id))
+            pipe.delete(self._progress_hb_key(task_id))
             if context_id:
                 pipe.hdel(self._context_index_key(context_id), task_id)
             await pipe.execute()
@@ -138,6 +158,66 @@ class RedisTaskStore(TaskStore):
     async def is_cancel_signalled(self, task_id: str) -> bool:
         """Return True if signal_cancel was called and the signal has not expired."""
         return bool(await self._r.exists(self._cancel_key(task_id)))
+
+    # ── Progress log + heartbeat ──────────────────────────────────────────────
+
+    async def append_progress(self, task_id: str, message: str) -> int:
+        """Atomically allocate a sequence number, append the entry, refresh TTLs."""
+        seq_key = self._progress_seq_key(task_id)
+        log_key = self._progress_log_key(task_id)
+        hb_key = self._progress_hb_key(task_id)
+        now = time.time()
+
+        seq = await self._r.incr(seq_key)
+        # ``message`` may contain any byte sequence; the leading "seq|ts|" prefix
+        # uses a single pipe so the splitter only consumes two — anything in the
+        # message body is preserved verbatim.
+        entry = f"{seq}|{now}|{message}"
+        async with self._r.pipeline(transaction=True) as pipe:
+            pipe.rpush(log_key, entry)
+            pipe.set(hb_key, str(now), ex=_PROGRESS_TTL)
+            pipe.expire(seq_key, _PROGRESS_TTL)
+            pipe.expire(log_key, _PROGRESS_TTL)
+            await pipe.execute()
+        return seq
+
+    async def read_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> list[ProgressEntry]:
+        """Return entries with seq > since_seq, in append order."""
+        raw_entries = await self._r.lrange(self._progress_log_key(task_id), 0, -1)
+        entries: list[ProgressEntry] = []
+        for raw in raw_entries:
+            try:
+                seq_str, ts_str, message = raw.split("|", 2)
+                seq = int(seq_str)
+                if seq <= since_seq:
+                    continue
+                entries.append(ProgressEntry(seq=seq, message=message, ts=float(ts_str)))
+            except (ValueError, AttributeError):
+                log.warning("Skipping malformed progress entry for task_id=%s", task_id)
+        return entries
+
+    async def clear_progress(self, task_id: str) -> None:
+        async with self._r.pipeline(transaction=True) as pipe:
+            pipe.delete(self._progress_log_key(task_id))
+            pipe.delete(self._progress_seq_key(task_id))
+            pipe.delete(self._progress_hb_key(task_id))
+            await pipe.execute()
+
+    async def heartbeat(self, task_id: str) -> None:
+        await self._r.set(self._progress_hb_key(task_id), str(time.time()), ex=_PROGRESS_TTL)
+
+    async def get_heartbeat(self, task_id: str) -> float | None:
+        value = await self._r.get(self._progress_hb_key(task_id))
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
 
     async def list_by_context(
         self,

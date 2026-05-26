@@ -261,6 +261,7 @@ Reply guidelines:
 image_agent: Agent[AgentDeps] = Agent(
     model=_chat_model,
     deps_type=AgentDeps,
+    output_type=str | None,
     system_prompt=SYSTEM_PROMPT,
     end_strategy="exhaustive",
 )

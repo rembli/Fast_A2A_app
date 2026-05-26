@@ -31,9 +31,15 @@ from google.protobuf.json_format import MessageToJson, Parse
 from a2a.server.tasks import TaskStore
 from a2a.types import ListTasksRequest, ListTasksResponse, Task
 
+from ._types import ProgressEntry
+
 log = logging.getLogger(__name__)
 
 _CANCEL_SIGNAL_TTL = 300  # 5 min — matches RedisTaskStore.
+
+
+def _utcnow() -> float:
+    return time.time()
 
 
 class MemoryTaskStore(TaskStore):
@@ -45,6 +51,9 @@ class MemoryTaskStore(TaskStore):
         self._context_index: dict[str, dict[str, int]] = {}
         self._context_sequence: dict[str, int] = {}
         self._cancel_signals: dict[str, float] = {}
+        self._progress_log: dict[str, list[tuple[int, str, float]]] = {}
+        self._progress_seq: dict[str, int] = {}
+        self._heartbeats: dict[str, float] = {}
         self._lock = asyncio.Lock()
         log.info(
             "MemoryTaskStore initialized — in-process only; "
@@ -99,6 +108,9 @@ class MemoryTaskStore(TaskStore):
                 index = self._context_index.get(context_id)
                 if index is not None:
                     index.pop(task_id, None)
+            self._progress_log.pop(task_id, None)
+            self._progress_seq.pop(task_id, None)
+            self._heartbeats.pop(task_id, None)
 
     async def list(self, params: ListTasksRequest, context=None) -> ListTasksResponse:
         """Return an empty list — full task listing is not required for A2A operation."""
@@ -121,6 +133,48 @@ class MemoryTaskStore(TaskStore):
                 self._cancel_signals.pop(task_id, None)
                 return False
             return True
+
+    # ── Progress log + heartbeat ──────────────────────────────────────────────
+
+    async def append_progress(self, task_id: str, message: str) -> int:
+        """Append a progress message and bump the heartbeat."""
+        now = _utcnow()
+        async with self._lock:
+            seq = self._progress_seq.get(task_id, 0) + 1
+            self._progress_seq[task_id] = seq
+            self._progress_log.setdefault(task_id, []).append((seq, message, now))
+            self._heartbeats[task_id] = now
+            return seq
+
+    async def read_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> list[ProgressEntry]:
+        """Return persisted progress entries with seq > since_seq, in order."""
+        async with self._lock:
+            entries = list(self._progress_log.get(task_id, ()))
+        return [
+            ProgressEntry(seq=seq, message=message, ts=ts)
+            for seq, message, ts in entries
+            if seq > since_seq
+        ]
+
+    async def clear_progress(self, task_id: str) -> None:
+        """Drop the progress log and heartbeat for a finished task."""
+        async with self._lock:
+            self._progress_log.pop(task_id, None)
+            self._progress_seq.pop(task_id, None)
+            self._heartbeats.pop(task_id, None)
+
+    async def heartbeat(self, task_id: str) -> None:
+        """Refresh the worker-liveness marker."""
+        async with self._lock:
+            self._heartbeats[task_id] = _utcnow()
+
+    async def get_heartbeat(self, task_id: str) -> float | None:
+        async with self._lock:
+            return self._heartbeats.get(task_id)
 
     async def list_by_context(
         self,

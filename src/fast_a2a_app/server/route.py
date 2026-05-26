@@ -51,6 +51,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 
@@ -65,14 +66,17 @@ from a2a.server.agent_execution.simple_request_context_builder import (
 )
 from a2a.server.context import ServerCallContext
 from a2a.server.events import EventQueue
-from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.request_handlers import DefaultRequestHandler, validate_request_params
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.utils.errors import TaskNotFoundError
 from a2a.types import (
     AgentCard,
     Artifact,
+    GetTaskRequest,
     Part,
     Role,
     SendMessageRequest,
+    SubscribeToTaskRequest,
     Task,
     TaskArtifactUpdateEvent,
     TaskState,
@@ -82,7 +86,7 @@ from a2a.types import (
 from starlette.routing import Router
 
 from .task_stores import A2ATaskStore, MemoryTaskStore
-from .utils import _progress_cb
+from .utils import _ProgressMeta, _progress_cb, _progress_meta
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +94,12 @@ _TRANSIENT_AGENT_TEXTS = frozenset({"processing request..."})
 
 # Seconds between cancel-signal polls. Lower = faster cancellation, more Redis traffic.
 _CANCEL_POLL_INTERVAL = 2
+
+# Seconds between worker heartbeats. The progress-aware request handler treats
+# a task whose heartbeat is older than _STALE_THRESHOLD as a crashed worker
+# and surfaces it as TASK_STATE_FAILED on the next GetTask / SubscribeToTask.
+_HEARTBEAT_INTERVAL = 5
+_STALE_THRESHOLD = 30
 
 # Sentinel distinguishing in-band progress strings from the final response text.
 # Null bytes make accidental collisions with real LLM output virtually impossible.
@@ -292,6 +302,16 @@ class ConfigurableAgentExecutor(AgentExecutor):
     def _default_prompt_builder(context: RequestContext) -> str:
         return context.get_user_input()
 
+    def is_running_locally(self, task_id: str) -> bool:
+        """True if ``execute()`` is currently driving ``task_id`` in this process.
+
+        Used by the progress-aware request handler to decide whether a live
+        SSE re-subscription is possible (same-process reconnect) or whether
+        the only safe response is a snapshot + persisted-progress replay.
+        """
+        running = self._running_tasks.get(task_id)
+        return running is not None and not running.done()
+
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Run the agent for one A2A task, emitting task/status/artifact events."""
         message = context.message
@@ -322,6 +342,16 @@ class ConfigurableAgentExecutor(AgentExecutor):
                 ),
             )
         )
+
+        # Bind the task to ``_progress_meta`` so each ``report_progress(...)``
+        # call inside the agent also writes to the task store. The
+        # ContextVar token is reset in the ``finally`` block at the bottom
+        # of ``execute()`` so the binding never leaks across requests.
+        progress_meta_token = None
+        if self._task_store and task_id:
+            progress_meta_token = _progress_meta.set(
+                _ProgressMeta(task_id=task_id, task_store=self._task_store)
+            )
 
         async def _do_work() -> None:
             try:
@@ -393,6 +423,7 @@ class ConfigurableAgentExecutor(AgentExecutor):
         self._running_tasks[task_id] = asyncio_task
 
         poll_task: asyncio.Task | None = None
+        heartbeat_task: asyncio.Task | None = None
         if self._task_store and task_id:
             store = self._task_store
 
@@ -406,7 +437,22 @@ class ConfigurableAgentExecutor(AgentExecutor):
                         log.debug("Cancel-signal poll error (task=%s)", task_id)
                     await asyncio.sleep(_CANCEL_POLL_INTERVAL)
 
+            async def _heartbeat() -> None:
+                # Prime immediately so a fast-failing task still records a
+                # heartbeat that the stale-detector can compare against.
+                try:
+                    await store.heartbeat(task_id)
+                except Exception:
+                    log.debug("Heartbeat write error (task=%s)", task_id)
+                while not asyncio_task.done():
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
+                    try:
+                        await store.heartbeat(task_id)
+                    except Exception:
+                        log.debug("Heartbeat write error (task=%s)", task_id)
+
             poll_task = asyncio.create_task(_poll_cancel_signal())
+            heartbeat_task = asyncio.create_task(_heartbeat())
 
         try:
             await asyncio_task
@@ -422,6 +468,16 @@ class ConfigurableAgentExecutor(AgentExecutor):
         finally:
             if poll_task is not None:
                 poll_task.cancel()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+            if progress_meta_token is not None:
+                _progress_meta.reset(progress_meta_token)
+            if self._task_store and task_id:
+                # Drop the persisted progress log now that the task has
+                # reached a terminal state — no further replay is useful and
+                # we don't want to leak rows up to the 24 h TTL.
+                with contextlib.suppress(Exception):
+                    await self._task_store.clear_progress(task_id)
             self._running_tasks.pop(task_id, None)
             self._task_contexts.pop(task_id, None)
 
@@ -570,6 +626,207 @@ class ConfigurableAgentExecutor(AgentExecutor):
                 status=TaskStatus(state=TaskState.TASK_STATE_CANCELED),
             )
         )
+
+
+# ── Progress-aware request handler ────────────────────────────────────────────
+
+_TERMINAL_TASK_STATES = frozenset({
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+})
+
+
+class ProgressAwareRequestHandler(DefaultRequestHandler):
+    """DefaultRequestHandler that replays persisted progress on resubscribe
+    and lazily marks zombie-WORKING tasks as FAILED.
+
+    Two failure modes the upstream handler can't recover from on its own:
+
+    1. **Crashed worker.** A task left in TASK_STATE_WORKING after its
+       executing replica died would hang the UI indefinitely (no terminal
+       event is ever emitted). On ``GetTask`` / ``SubscribeToTask`` we check
+       the per-task heartbeat written by ``ConfigurableAgentExecutor``; if
+       it's older than ``_STALE_THRESHOLD`` and no replica is currently
+       running the task, we flip the stored task to ``TASK_STATE_FAILED``
+       so the UI sees a terminal state.
+
+    2. **Lost progress.** ``report_progress(...)`` strings live only in
+       the executor's in-memory SSE queue. A network blip, a tab refresh,
+       or a worker bounce drops every message the UI hadn't already
+       received. The executor now persists them via the task store; we
+       replay the log here so the UI's thinking indicator picks up where
+       it left off when ``resubscribeTaskStream()`` reconnects.
+
+    Both checks are lazy — no background sweeper. The next request from
+    a client is what triggers the FAILED transition.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_executor: ConfigurableAgentExecutor,
+        task_store: A2ATaskStore,
+        progress_store: A2ATaskStore,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            agent_executor=agent_executor,
+            task_store=task_store,
+            **kwargs,
+        )
+        self._executor = agent_executor
+        # Kept as a separate attribute so type checkers don't have to assume
+        # ``self.task_store`` is the extended ``A2ATaskStore`` Protocol (the
+        # SDK base class types it as the narrower SDK ``TaskStore``).
+        self._progress_store: A2ATaskStore = progress_store
+
+    async def _is_stale(self, task_id: str) -> bool:
+        """True if the task has a heartbeat older than ``_STALE_THRESHOLD``.
+
+        Returns ``False`` (i.e. assume alive) when there's no heartbeat
+        recorded — covers tasks created before the store was upgraded and
+        tasks that never started.
+        """
+        try:
+            hb = await self._progress_store.get_heartbeat(task_id)
+        except Exception:
+            log.debug("Stale check failed for task=%s", task_id, exc_info=True)
+            return False
+        if hb is None:
+            return False
+        return (time.time() - hb) > _STALE_THRESHOLD
+
+    async def _mark_failed_after_crash(self, task: Task, context) -> Task:
+        """Persist TASK_STATE_FAILED on a task whose worker died mid-flight."""
+        task.status.state = TaskState.TASK_STATE_FAILED
+        failure_message = new_text_message(
+            "Agent worker stopped unexpectedly. Please retry.",
+            context_id=task.context_id,
+            task_id=task.id,
+        )
+        task.status.message.CopyFrom(failure_message)
+        with contextlib.suppress(Exception):
+            await self._progress_store.save(task, context)
+        with contextlib.suppress(Exception):
+            await self._progress_store.clear_progress(task.id)
+        return task
+
+    def _progress_to_event(
+        self,
+        task: Task,
+        message: str,
+    ) -> TaskStatusUpdateEvent:
+        return TaskStatusUpdateEvent(
+            task_id=task.id,
+            context_id=task.context_id,
+            status=TaskStatus(
+                state=TaskState.TASK_STATE_WORKING,
+                message=new_text_message(
+                    message,
+                    context_id=task.context_id,
+                    task_id=task.id,
+                ),
+            ),
+        )
+
+    @validate_request_params
+    async def on_get_task(self, params: GetTaskRequest, context):  # type: ignore[override]
+        """Lazily mark zombie-WORKING tasks as FAILED before returning them."""
+        task = await super().on_get_task(params, context)
+        if (
+            task is not None
+            and task.status.state == TaskState.TASK_STATE_WORKING
+            and not self._executor.is_running_locally(task.id)
+            and await self._is_stale(task.id)
+        ):
+            task = await self._mark_failed_after_crash(task, context)
+        return task
+
+    @validate_request_params
+    async def on_subscribe_to_task(  # type: ignore[override]
+        self,
+        params: SubscribeToTaskRequest,
+        context,
+    ):
+        """Replay persisted progress before delegating to the SDK's live stream.
+
+        For tasks running on this replica: yield the current Task snapshot,
+        replay any persisted progress as ``TASK_STATE_WORKING`` events, then
+        attach to the live event queue via ``super().on_subscribe_to_task``
+        (skipping its own initial Task event so we don't double-emit).
+
+        For tasks not running locally (crashed worker, or another replica):
+        replay everything we have from the store; the UI's snapshot fallback
+        will poll for the final state. We don't delegate to super() in this
+        case because the SDK would create a fresh ``ActiveTask`` and try to
+        re-execute the agent.
+        """
+        task_id = params.id
+        task = await self._progress_store.get(task_id, context)
+        if task is None:
+            # SDK's super() implementation hangs on a missing task (it
+            # creates an empty ActiveTask and waits for events). Raising
+            # TaskNotFoundError directly matches the JSON-RPC error mapping.
+            raise TaskNotFoundError
+
+        state = task.status.state
+
+        # Terminal: just yield the snapshot. Nothing to subscribe to.
+        if state in _TERMINAL_TASK_STATES:
+            yield task
+            return
+
+        # WORKING but worker is gone — surface FAILED. Yielding both the
+        # full Task (so the UI's transcript stays in sync) and an explicit
+        # status update lets ``processStreamPayload`` raise immediately
+        # instead of waiting for the snapshot fallback to detect it.
+        if (
+            state == TaskState.TASK_STATE_WORKING
+            and not self._executor.is_running_locally(task_id)
+            and await self._is_stale(task_id)
+        ):
+            task = await self._mark_failed_after_crash(task, context)
+            yield task
+            yield TaskStatusUpdateEvent(
+                task_id=task.id,
+                context_id=task.context_id,
+                status=task.status,
+            )
+            return
+
+        is_local = self._executor.is_running_locally(task_id)
+
+        # Snapshot first so the client has the latest task state.
+        yield task
+
+        # Replay persisted progress as working-status events; the UI's
+        # ``processStreamPayload`` handler already updates the thinking
+        # indicator on TASK_STATE_WORKING with a text message.
+        try:
+            entries = await self._progress_store.read_progress(task_id)
+        except Exception:
+            log.warning("Failed to read progress log for task=%s", task_id, exc_info=True)
+            entries = []
+        for entry in entries:
+            yield self._progress_to_event(task, entry.message)
+
+        if not is_local:
+            # Different replica (or worker still warming up) — no live
+            # subscription possible here. The client falls back to
+            # ``displayTaskSnapshot`` and polls via ``GetTask``.
+            return
+
+        # Same replica: tap into the SDK's live event queue. ``super()``
+        # yields the initial Task again first, which we drop to avoid the
+        # client receiving two Task events back-to-back.
+        seen_initial = False
+        async for event in super().on_subscribe_to_task(params, context):
+            if not seen_initial and isinstance(event, Task):
+                seen_initial = True
+                continue
+            yield event
 
 
 # ── Prompt building helpers ───────────────────────────────────────────────────
@@ -814,9 +1071,10 @@ def build_a2a_app(
         task_store=resolved_store,
         debug=debug,
     )
-    request_handler = DefaultRequestHandler(
+    request_handler = ProgressAwareRequestHandler(
         agent_executor=executor,
         task_store=resolved_store,
+        progress_store=resolved_store,
         agent_card=agent_card,
         request_context_builder=ContextAwareRequestContextBuilder(resolved_store),
     )

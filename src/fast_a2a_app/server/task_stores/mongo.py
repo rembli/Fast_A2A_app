@@ -22,10 +22,22 @@ COLLECTIONS
 
     {"_id": task_id, "expires_at": datetime}
                                  — TTL index on ``expires_at`` (5 min).
+
+``progress``::
+
+    {"_id": "{task_id}:{seq}", "task_id": "...", "seq": int,
+     "message": "...", "ts": float, "expires_at": datetime}
+                                 — append-only log; TTL on ``expires_at`` (24 h).
+
+``progress_heartbeats``::
+
+    {"_id": task_id, "ts": float, "expires_at": datetime}
+                                 — bumped by the executor; TTL (24 h).
 """
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from google.protobuf.json_format import MessageToJson, Parse
@@ -33,10 +45,13 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from a2a.server.tasks import TaskStore
 from a2a.types import ListTasksRequest, ListTasksResponse, Task
 
+from ._types import ProgressEntry
+
 log = logging.getLogger(__name__)
 
 _TTL_SECONDS = 86_400          # 24 h
 _CANCEL_SIGNAL_TTL_SECONDS = 300  # 5 min
+_PROGRESS_TTL_SECONDS = 86_400  # 24 h — matches task TTL
 
 
 def _utcnow() -> datetime:
@@ -56,6 +71,8 @@ class MongoTaskStore(TaskStore):
         self._tasks = self._db["tasks"]
         self._context_index = self._db["context_index"]
         self._cancel_signals = self._db["cancel_signals"]
+        self._progress = self._db["progress"]
+        self._progress_heartbeats = self._db["progress_heartbeats"]
         self._indexes_ready = False
         log.info("MongoTaskStore initialized (database=%s)", database_name)
 
@@ -81,6 +98,11 @@ class MongoTaskStore(TaskStore):
             [("context_id", 1), ("sequence", 1)],
         )
         await self._cancel_signals.create_index("expires_at", expireAfterSeconds=0)
+        await self._progress.create_index("expires_at", expireAfterSeconds=0)
+        await self._progress.create_index([("task_id", 1), ("seq", 1)])
+        await self._progress_heartbeats.create_index(
+            "expires_at", expireAfterSeconds=0
+        )
         self._indexes_ready = True
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -160,7 +182,7 @@ class MongoTaskStore(TaskStore):
             return None
 
     async def delete(self, task_id: str, context=None) -> None:
-        """Remove a task and its context index entry."""
+        """Remove a task, its context index entry, and its progress log."""
         document = await self._tasks.find_one(
             {"_id": task_id}, projection={"context_id": 1}
         )
@@ -169,6 +191,8 @@ class MongoTaskStore(TaskStore):
             await self._context_index.delete_one(
                 {"_id": self._index_id(document["context_id"], task_id)}
             )
+        await self._progress.delete_many({"task_id": task_id})
+        await self._progress_heartbeats.delete_one({"_id": task_id})
 
     async def list(self, params: ListTasksRequest, context=None) -> ListTasksResponse:
         """Return an empty list — full task listing is not required for A2A operation."""
@@ -195,6 +219,77 @@ class MongoTaskStore(TaskStore):
             projection={"_id": 1},
         )
         return document is not None
+
+    # ── Progress log + heartbeat ──────────────────────────────────────────────
+
+    async def append_progress(self, task_id: str, message: str) -> int:
+        """Append a progress entry; ``seq`` is allocated as ``max(seq)+1`` for the task.
+
+        Concurrent calls for the same task are rare (one worker per task) so the
+        non-atomic read-then-write is acceptable; the unique ``_id`` index
+        ensures a duplicate seq would surface as an exception rather than silent
+        corruption.
+        """
+        await self.ensure_indexes()
+        now = time.time()
+        expires_at = _utcnow() + timedelta(seconds=_PROGRESS_TTL_SECONDS)
+
+        last = await self._progress.find_one(
+            {"task_id": task_id},
+            sort=[("seq", -1)],
+            projection={"seq": 1},
+        )
+        seq = (last["seq"] if last else 0) + 1
+        await self._progress.insert_one({
+            "_id": f"{task_id}:{seq}",
+            "task_id": task_id,
+            "seq": seq,
+            "message": message,
+            "ts": now,
+            "expires_at": expires_at,
+        })
+        await self._progress_heartbeats.replace_one(
+            {"_id": task_id},
+            {"_id": task_id, "ts": now, "expires_at": expires_at},
+            upsert=True,
+        )
+        return seq
+
+    async def read_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> list[ProgressEntry]:
+        """Return entries with seq > since_seq in ascending seq order."""
+        cursor = self._progress.find(
+            {"task_id": task_id, "seq": {"$gt": since_seq}},
+            projection={"seq": 1, "message": 1, "ts": 1, "_id": 0},
+        ).sort("seq", 1)
+        return [
+            ProgressEntry(seq=doc["seq"], message=doc["message"], ts=doc["ts"])
+            async for doc in cursor
+        ]
+
+    async def clear_progress(self, task_id: str) -> None:
+        await self._progress.delete_many({"task_id": task_id})
+        await self._progress_heartbeats.delete_one({"_id": task_id})
+
+    async def heartbeat(self, task_id: str) -> None:
+        await self.ensure_indexes()
+        expires_at = _utcnow() + timedelta(seconds=_PROGRESS_TTL_SECONDS)
+        await self._progress_heartbeats.replace_one(
+            {"_id": task_id},
+            {"_id": task_id, "ts": time.time(), "expires_at": expires_at},
+            upsert=True,
+        )
+
+    async def get_heartbeat(self, task_id: str) -> float | None:
+        document = await self._progress_heartbeats.find_one(
+            {"_id": task_id}, projection={"ts": 1}
+        )
+        if document is None:
+            return None
+        return document.get("ts")
 
     async def list_by_context(
         self,

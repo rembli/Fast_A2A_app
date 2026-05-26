@@ -25,6 +25,7 @@ from typing import Protocol
 
 from a2a.types import ListTasksRequest, ListTasksResponse, Task
 
+from ._types import ProgressEntry
 from .memory import MemoryTaskStore
 from .mongo import MongoTaskStore
 from .postgres import PostgresTaskStore
@@ -35,8 +36,10 @@ class A2ATaskStore(Protocol):
     """Storage-agnostic interface for A2A task persistence.
 
     Extends the SDK's ``TaskStore`` contract with ``list_by_context`` (for
-    conversation-history injection) and cancel-signal primitives (for
-    cross-instance task cancellation).
+    conversation-history injection), cancel-signal primitives (for
+    cross-instance task cancellation), and a per-task append-only progress
+    log + worker heartbeat (so ``report_progress(...)`` strings survive a
+    crash and the UI can replay them on resubscribe).
     """
 
     async def save(self, task: Task, context=None) -> None: ...
@@ -52,11 +55,44 @@ class A2ATaskStore(Protocol):
     async def signal_cancel(self, task_id: str) -> None: ...
     async def is_cancel_signalled(self, task_id: str) -> bool: ...
 
+    # ── Progress log + worker heartbeat ───────────────────────────────────────
+    # Backends persist progress events so they survive a worker crash. On
+    # resubscribe, the request handler replays the log so the UI's thinking
+    # indicator picks up where it left off. ``heartbeat`` is bumped by the
+    # executor while the task is running; ``get_heartbeat`` lets the handler
+    # detect zombie-WORKING tasks whose worker has died.
+
+    async def append_progress(self, task_id: str, message: str) -> int:
+        """Append ``message`` to the task's progress log and bump the heartbeat.
+
+        Returns the new monotonic sequence number (starts at 1).
+        """
+        ...
+
+    async def read_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> list[ProgressEntry]: ...
+
+    async def clear_progress(self, task_id: str) -> None:
+        """Drop all progress records for a task. Called on terminal states."""
+        ...
+
+    async def heartbeat(self, task_id: str) -> None:
+        """Refresh the worker-liveness marker without writing progress."""
+        ...
+
+    async def get_heartbeat(self, task_id: str) -> float | None:
+        """Return the last heartbeat as unix seconds, or ``None`` if absent."""
+        ...
+
 
 __all__ = [
     "A2ATaskStore",
     "MemoryTaskStore",
     "MongoTaskStore",
     "PostgresTaskStore",
+    "ProgressEntry",
     "RedisTaskStore",
 ]

@@ -28,10 +28,26 @@ SCHEMA
         task_id      TEXT PRIMARY KEY,
         expires_at   TIMESTAMPTZ NOT NULL
     );
+
+    a2a_progress(
+        task_id      TEXT NOT NULL,
+        seq          BIGINT NOT NULL,
+        message      TEXT NOT NULL,
+        ts           DOUBLE PRECISION NOT NULL,
+        expires_at   TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (task_id, seq)
+    );
+
+    a2a_progress_heartbeats(
+        task_id      TEXT PRIMARY KEY,
+        ts           DOUBLE PRECISION NOT NULL,
+        expires_at   TIMESTAMPTZ NOT NULL
+    );
 """
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
@@ -39,10 +55,13 @@ from google.protobuf.json_format import MessageToJson, Parse
 from a2a.server.tasks import TaskStore
 from a2a.types import ListTasksRequest, ListTasksResponse, Task
 
+from ._types import ProgressEntry
+
 log = logging.getLogger(__name__)
 
 _TTL_SECONDS = 86_400          # 24 h
 _CANCEL_SIGNAL_TTL_SECONDS = 300  # 5 min
+_PROGRESS_TTL_SECONDS = 86_400  # 24 h — matches task TTL
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS a2a_tasks (
@@ -68,6 +87,23 @@ CREATE INDEX IF NOT EXISTS a2a_context_index_seq_idx
 
 CREATE TABLE IF NOT EXISTS a2a_cancel_signals (
     task_id     TEXT PRIMARY KEY,
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS a2a_progress (
+    task_id     TEXT NOT NULL,
+    seq         BIGINT NOT NULL,
+    message     TEXT NOT NULL,
+    ts          DOUBLE PRECISION NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (task_id, seq)
+);
+CREATE INDEX IF NOT EXISTS a2a_progress_expires_at_idx
+    ON a2a_progress (expires_at);
+
+CREATE TABLE IF NOT EXISTS a2a_progress_heartbeats (
+    task_id     TEXT PRIMARY KEY,
+    ts          DOUBLE PRECISION NOT NULL,
     expires_at  TIMESTAMPTZ NOT NULL
 );
 """
@@ -174,7 +210,7 @@ class PostgresTaskStore(TaskStore):
             return None
 
     async def delete(self, task_id: str, context=None) -> None:
-        """Remove a task and its context index entry."""
+        """Remove a task, its context index entry, and its progress log."""
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 context_id = await connection.fetchval(
@@ -186,6 +222,12 @@ class PostgresTaskStore(TaskStore):
                         "DELETE FROM a2a_context_index WHERE context_id = $1 AND task_id = $2",
                         context_id, task_id,
                     )
+                await connection.execute(
+                    "DELETE FROM a2a_progress WHERE task_id = $1", task_id,
+                )
+                await connection.execute(
+                    "DELETE FROM a2a_progress_heartbeats WHERE task_id = $1", task_id,
+                )
 
     async def list(self, params: ListTasksRequest, context=None) -> ListTasksResponse:
         """Return an empty list — full task listing is not required for A2A operation."""
@@ -213,6 +255,90 @@ class PostgresTaskStore(TaskStore):
             task_id,
         )
         return value is not None
+
+    # ── Progress log + heartbeat ──────────────────────────────────────────────
+
+    async def append_progress(self, task_id: str, message: str) -> int:
+        """Allocate the next seq, insert the entry, and bump the heartbeat."""
+        await self.ensure_schema()
+        now = time.time()
+        expires_at = _utcnow() + timedelta(seconds=_PROGRESS_TTL_SECONDS)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                seq = await connection.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM a2a_progress "
+                    "WHERE task_id = $1",
+                    task_id,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO a2a_progress (task_id, seq, message, ts, expires_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    task_id, seq, message, now, expires_at,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO a2a_progress_heartbeats (task_id, ts, expires_at)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (task_id) DO UPDATE SET
+                        ts = EXCLUDED.ts,
+                        expires_at = EXCLUDED.expires_at
+                    """,
+                    task_id, now, expires_at,
+                )
+        return seq
+
+    async def read_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> list[ProgressEntry]:
+        rows = await self._pool.fetch(
+            """
+            SELECT seq, message, ts
+            FROM a2a_progress
+            WHERE task_id = $1 AND seq > $2 AND expires_at > NOW()
+            ORDER BY seq
+            """,
+            task_id, since_seq,
+        )
+        return [
+            ProgressEntry(seq=row["seq"], message=row["message"], ts=row["ts"])
+            for row in rows
+        ]
+
+    async def clear_progress(self, task_id: str) -> None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM a2a_progress WHERE task_id = $1", task_id,
+                )
+                await connection.execute(
+                    "DELETE FROM a2a_progress_heartbeats WHERE task_id = $1", task_id,
+                )
+
+    async def heartbeat(self, task_id: str) -> None:
+        await self.ensure_schema()
+        expires_at = _utcnow() + timedelta(seconds=_PROGRESS_TTL_SECONDS)
+        await self._pool.execute(
+            """
+            INSERT INTO a2a_progress_heartbeats (task_id, ts, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id) DO UPDATE SET
+                ts = EXCLUDED.ts,
+                expires_at = EXCLUDED.expires_at
+            """,
+            task_id, time.time(), expires_at,
+        )
+
+    async def get_heartbeat(self, task_id: str) -> float | None:
+        value = await self._pool.fetchval(
+            "SELECT ts FROM a2a_progress_heartbeats "
+            "WHERE task_id = $1 AND expires_at > NOW()",
+            task_id,
+        )
+        return value
 
     async def list_by_context(
         self,
