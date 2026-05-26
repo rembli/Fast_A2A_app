@@ -77,6 +77,7 @@ from .server import (
     image_artifact,
     map_artifact,
     prompt_suggestions_artifact,
+    register_progress_resolver,
     report_progress,
     table_artifact,
     text_artifact,
@@ -112,6 +113,7 @@ __all__ = [
     "MongoTaskStore",
     "PostgresTaskStore",
     "RedisTaskStore",
+    "register_progress_resolver",
     "report_progress",
     # UI
     "a2a_ui",

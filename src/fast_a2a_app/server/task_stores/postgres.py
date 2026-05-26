@@ -46,8 +46,11 @@ SCHEMA
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
@@ -62,6 +65,9 @@ log = logging.getLogger(__name__)
 _TTL_SECONDS = 86_400          # 24 h
 _CANCEL_SIGNAL_TTL_SECONDS = 300  # 5 min
 _PROGRESS_TTL_SECONDS = 86_400  # 24 h — matches task TTL
+# Single global LISTEN channel; the payload carries the task_id so a
+# subscriber filters in-process rather than maintaining per-task LISTENs.
+_PROGRESS_CHANNEL = "a2a_progress"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS a2a_tasks (
@@ -287,6 +293,12 @@ class PostgresTaskStore(TaskStore):
                     """,
                     task_id, now, expires_at,
                 )
+                # Wake any live ``subscribe_progress`` tailers. The NOTIFY
+                # fires when the surrounding transaction commits, so the
+                # row a subscriber re-reads is guaranteed visible.
+                await connection.execute(
+                    "SELECT pg_notify($1, $2)", _PROGRESS_CHANNEL, task_id,
+                )
         return seq
 
     async def read_progress(
@@ -307,6 +319,43 @@ class PostgresTaskStore(TaskStore):
             ProgressEntry(seq=row["seq"], message=row["message"], ts=row["ts"])
             for row in rows
         ]
+
+    async def subscribe_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> AsyncIterator[ProgressEntry]:
+        """Live-tail progress for ``task_id`` using ``LISTEN/NOTIFY``.
+
+        Holds one pooled connection for the LISTEN; releases it on
+        consumer aclose / GC. On each NOTIFY the subscriber re-reads
+        ``a2a_progress`` for rows past ``last_seq`` — cheap and avoids
+        encoding the entire entry into the 8 KB NOTIFY payload limit.
+        """
+        await self.ensure_schema()
+        wake: asyncio.Queue[None] = asyncio.Queue()
+
+        def _on_notify(_connection, _pid, _channel, payload):
+            if payload == task_id:
+                wake.put_nowait(None)
+
+        async with self._pool.acquire() as listen_conn:
+            await listen_conn.add_listener(_PROGRESS_CHANNEL, _on_notify)
+            try:
+                last_seq = since_seq
+                for entry in await self.read_progress(task_id, last_seq):
+                    last_seq = entry.seq
+                    yield entry
+                while True:
+                    await wake.get()
+                    for entry in await self.read_progress(task_id, last_seq):
+                        last_seq = entry.seq
+                        yield entry
+            finally:
+                with contextlib.suppress(Exception):
+                    await listen_conn.remove_listener(
+                        _PROGRESS_CHANNEL, _on_notify,
+                    )
 
     async def clear_progress(self, task_id: str) -> None:
         async with self._pool.acquire() as connection:

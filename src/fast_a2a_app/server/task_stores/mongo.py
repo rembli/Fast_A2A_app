@@ -36,8 +36,10 @@ COLLECTIONS
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 
 from google.protobuf.json_format import MessageToJson, Parse
@@ -52,6 +54,10 @@ log = logging.getLogger(__name__)
 _TTL_SECONDS = 86_400          # 24 h
 _CANCEL_SIGNAL_TTL_SECONDS = 300  # 5 min
 _PROGRESS_TTL_SECONDS = 86_400  # 24 h — matches task TTL
+# Live-tail poll interval. Mongo change streams would give push semantics
+# but require a replica set / sharded cluster — polling at a modest rate
+# keeps the backend usable against a standalone ``mongod``.
+_SUBSCRIBE_POLL_INTERVAL = 0.5  # seconds
 
 
 def _utcnow() -> datetime:
@@ -269,6 +275,26 @@ class MongoTaskStore(TaskStore):
             ProgressEntry(seq=doc["seq"], message=doc["message"], ts=doc["ts"])
             async for doc in cursor
         ]
+
+    async def subscribe_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> AsyncIterator[ProgressEntry]:
+        """Live-tail progress for ``task_id`` by polling ``a2a_progress``.
+
+        Mongo's push primitives (change streams, tailable cursors on
+        capped collections) require a replica set or a capped collection
+        respectively. Polling at ``_SUBSCRIBE_POLL_INTERVAL`` works
+        against a vanilla standalone ``mongod`` with no setup; the
+        consumer-facing API is identical to the other backends.
+        """
+        last_seq = since_seq
+        while True:
+            for entry in await self.read_progress(task_id, last_seq):
+                last_seq = entry.seq
+                yield entry
+            await asyncio.sleep(_SUBSCRIBE_POLL_INTERVAL)
 
     async def clear_progress(self, task_id: str) -> None:
         await self._progress.delete_many({"task_id": task_id})

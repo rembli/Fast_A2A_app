@@ -21,6 +21,7 @@ instance to ``build_a2a_app(task_store=...)``.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from a2a.types import ListTasksRequest, ListTasksResponse, Task
@@ -74,6 +75,25 @@ class A2ATaskStore(Protocol):
         task_id: str,
         since_seq: int = 0,
     ) -> list[ProgressEntry]: ...
+
+    def subscribe_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> AsyncIterator[ProgressEntry]:
+        """Live-tail the task's progress log as an async iterator.
+
+        Yields any persisted entries with ``seq > since_seq`` first
+        (catch-up), then waits for new entries written via
+        ``append_progress`` and yields them as they arrive. The iterator
+        runs until the consumer stops iterating or calls ``aclose()``.
+
+        Backends implement the live-tail differently — in-process queues
+        for ``MemoryTaskStore``, ``LISTEN/NOTIFY`` for Postgres, pub/sub
+        for Redis, polling for Mongo — but the consumer-facing contract
+        is identical.
+        """
+        ...
 
     async def clear_progress(self, task_id: str) -> None:
         """Drop all progress records for a task. Called on terminal states."""

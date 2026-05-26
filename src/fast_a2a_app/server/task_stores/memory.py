@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
 
 from google.protobuf.json_format import MessageToJson, Parse
 from a2a.server.tasks import TaskStore
@@ -54,6 +55,13 @@ class MemoryTaskStore(TaskStore):
         self._progress_log: dict[str, list[tuple[int, str, float]]] = {}
         self._progress_seq: dict[str, int] = {}
         self._heartbeats: dict[str, float] = {}
+        # Per-task list of live-tail queues. Each ``subscribe_progress``
+        # call registers one queue; ``append_progress`` fans an entry out
+        # to every queue while still holding ``_lock``, so subscribers
+        # see entries in the same order as the persisted log.
+        self._progress_subscribers: dict[
+            str, list[asyncio.Queue[ProgressEntry]]
+        ] = {}
         self._lock = asyncio.Lock()
         log.info(
             "MemoryTaskStore initialized — in-process only; "
@@ -144,6 +152,9 @@ class MemoryTaskStore(TaskStore):
             self._progress_seq[task_id] = seq
             self._progress_log.setdefault(task_id, []).append((seq, message, now))
             self._heartbeats[task_id] = now
+            entry = ProgressEntry(seq=seq, message=message, ts=now)
+            for queue in self._progress_subscribers.get(task_id, ()):
+                queue.put_nowait(entry)
             return seq
 
     async def read_progress(
@@ -159,6 +170,47 @@ class MemoryTaskStore(TaskStore):
             for seq, message, ts in entries
             if seq > since_seq
         ]
+
+    async def subscribe_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> AsyncIterator[ProgressEntry]:
+        """Yield persisted entries first, then any future appends live."""
+        queue: asyncio.Queue[ProgressEntry] = asyncio.Queue()
+        async with self._lock:
+            # Register the queue under the same lock as append_progress so
+            # entries written after this point all get queued — no race
+            # between snapshot and registration.
+            self._progress_subscribers.setdefault(task_id, []).append(queue)
+            snapshot = [
+                ProgressEntry(seq=seq, message=message, ts=ts)
+                for seq, message, ts in self._progress_log.get(task_id, ())
+                if seq > since_seq
+            ]
+            last_seq = snapshot[-1].seq if snapshot else since_seq
+        try:
+            for entry in snapshot:
+                yield entry
+            while True:
+                entry = await queue.get()
+                # Suppress entries already covered by the snapshot replay —
+                # they get queued during the registration window but are
+                # already represented in ``snapshot``.
+                if entry.seq <= last_seq:
+                    continue
+                last_seq = entry.seq
+                yield entry
+        finally:
+            async with self._lock:
+                subscribers = self._progress_subscribers.get(task_id)
+                if subscribers is not None:
+                    try:
+                        subscribers.remove(queue)
+                    except ValueError:
+                        pass
+                    if not subscribers:
+                        self._progress_subscribers.pop(task_id, None)
 
     async def clear_progress(self, task_id: str) -> None:
         """Drop the progress log and heartbeat for a finished task."""

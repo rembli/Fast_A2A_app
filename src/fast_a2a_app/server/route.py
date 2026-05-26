@@ -101,6 +101,12 @@ _CANCEL_POLL_INTERVAL = 2
 _HEARTBEAT_INTERVAL = 5
 _STALE_THRESHOLD = 30
 
+# How often the non-local resubscribe branch re-checks task state for a
+# terminal transition. The progress stream itself wakes on push (LISTEN /
+# pub/sub) — this poll is only needed because terminal state lives on
+# the Task, not in the progress log.
+_REMOTE_STATE_POLL_INTERVAL = 2.0
+
 # Sentinel distinguishing in-band progress strings from the final response text.
 # Null bytes make accidental collisions with real LLM output virtually impossible.
 _PROGRESS_PREFIX = "\x00p\x00"
@@ -733,7 +739,16 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
 
     @validate_request_params
     async def on_get_task(self, params: GetTaskRequest, context):  # type: ignore[override]
-        """Lazily mark zombie-WORKING tasks as FAILED before returning them."""
+        """Lazily mark zombie-WORKING tasks as FAILED before returning them.
+
+        "Zombie" = WORKING task whose log hasn't been touched in
+        ``_STALE_THRESHOLD`` seconds. Anything still actively writing
+        progress (whether the in-process executor or a recovered
+        durable-execution workflow) refreshes the heartbeat as a side
+        effect of every ``append_progress`` write, so a stale heartbeat
+        unambiguously means nobody is making forward progress on this
+        task.
+        """
         task = await super().on_get_task(params, context)
         if (
             task is not None
@@ -801,32 +816,99 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
         # Snapshot first so the client has the latest task state.
         yield task
 
-        # Replay persisted progress as working-status events; the UI's
-        # ``processStreamPayload`` handler already updates the thinking
-        # indicator on TASK_STATE_WORKING with a text message.
-        try:
-            entries = await self._progress_store.read_progress(task_id)
-        except Exception:
-            log.warning("Failed to read progress log for task=%s", task_id, exc_info=True)
-            entries = []
-        for entry in entries:
-            yield self._progress_to_event(task, entry.message)
+        if is_local:
+            # Same replica: progress + artifacts + terminal events all
+            # flow through the SDK's in-process EventQueue. Replay the
+            # persisted log so the UI's thinking indicator catches up,
+            # then tap into ``super()`` for live events. ``super()``
+            # yields the initial Task again first, which we drop to
+            # avoid the client receiving two Task events back-to-back.
+            try:
+                entries = await self._progress_store.read_progress(task_id)
+            except Exception:
+                log.warning(
+                    "Failed to read progress log for task=%s", task_id, exc_info=True,
+                )
+                entries = []
+            for entry in entries:
+                yield self._progress_to_event(task, entry.message)
 
-        if not is_local:
-            # Different replica (or worker still warming up) — no live
-            # subscription possible here. The client falls back to
-            # ``displayTaskSnapshot`` and polls via ``GetTask``.
+            seen_initial = False
+            async for event in super().on_subscribe_to_task(params, context):
+                if not seen_initial and isinstance(event, Task):
+                    seen_initial = True
+                    continue
+                yield event
             return
 
-        # Same replica: tap into the SDK's live event queue. ``super()``
-        # yields the initial Task again first, which we drop to avoid the
-        # client receiving two Task events back-to-back.
-        seen_initial = False
-        async for event in super().on_subscribe_to_task(params, context):
-            if not seen_initial and isinstance(event, Task):
-                seen_initial = True
-                continue
+        # Different replica (or DBOS-recovered workflow) — the in-process
+        # EventQueue is empty here, but ``report_progress`` calls on the
+        # executing instance land in the task store. Live-tail the store
+        # for progress events while polling task state in parallel so we
+        # can yield the final Task snapshot when the worker terminates.
+        async for event in self._tail_remote_progress(task, context):
             yield event
+
+    async def _tail_remote_progress(self, task: Task, context):
+        """Yield progress events (and terminal snapshot) for a non-local task.
+
+        Two concurrent producers feed this loop:
+
+        * ``subscribe_progress`` — push-driven (LISTEN/NOTIFY on Postgres,
+          pub/sub on Redis, in-process queue on Memory, poll on Mongo).
+          Yielded as ``TaskStatusUpdateEvent`` so the UI's thinking
+          indicator updates in real time.
+        * ``_poll_state`` — periodically re-reads the task; on terminal
+          we yield the fresh Task snapshot and return so the UI flips
+          out of WORKING.
+        """
+        task_id = task.id
+        progress_iter = self._progress_store.subscribe_progress(task_id).__aiter__()
+
+        async def _poll_state() -> Task | None:
+            while True:
+                await asyncio.sleep(_REMOTE_STATE_POLL_INTERVAL)
+                try:
+                    current = await self._progress_store.get(task_id, context)
+                except Exception:
+                    log.debug(
+                        "Remote-tail state poll failed for task=%s",
+                        task_id, exc_info=True,
+                    )
+                    continue
+                if current is None:
+                    return None
+                if current.status.state in _TERMINAL_TASK_STATES:
+                    return current
+
+        state_task = asyncio.create_task(_poll_state())
+        next_entry_task = asyncio.create_task(progress_iter.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {state_task, next_entry_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if state_task in done:
+                    final = state_task.result()
+                    if final is not None:
+                        yield final
+                    return
+                try:
+                    entry = next_entry_task.result()
+                except StopAsyncIteration:
+                    # The progress iterator finished. Shouldn't happen
+                    # for our backends (they run until aclose) but if
+                    # it does the consumer falls back to GetTask polling.
+                    return
+                yield self._progress_to_event(task, entry.message)
+                next_entry_task = asyncio.create_task(progress_iter.__anext__())
+        finally:
+            state_task.cancel()
+            if not next_entry_task.done():
+                next_entry_task.cancel()
+            with contextlib.suppress(Exception):
+                await progress_iter.aclose()
 
 
 # ── Prompt building helpers ───────────────────────────────────────────────────

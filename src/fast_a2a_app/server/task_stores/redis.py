@@ -18,11 +18,16 @@ KEY SCHEMA
                                          appended on each report_progress(...).
     a2a:progress:{task_id}:seq         — monotonic counter for the log.
     a2a:progress:{task_id}:hb          — last-heartbeat unix seconds (string).
+    a2a:progress:{task_id}:channel     — pub/sub channel; ``append_progress``
+                                         PUBLISHes the new seq, ``subscribe_progress``
+                                         SUBSCRIBES and re-reads the log.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 
 import redis.asyncio as aioredis
 from google.protobuf.json_format import MessageToJson, Parse
@@ -83,6 +88,9 @@ class RedisTaskStore(TaskStore):
 
     def _progress_hb_key(self, task_id: str) -> str:
         return f"a2a:progress:{task_id}:hb"
+
+    def _progress_channel(self, task_id: str) -> str:
+        return f"a2a:progress:{task_id}:channel"
 
     # ── TaskStore protocol ────────────────────────────────────────────────────
 
@@ -178,6 +186,10 @@ class RedisTaskStore(TaskStore):
             pipe.set(hb_key, str(now), ex=_PROGRESS_TTL)
             pipe.expire(seq_key, _PROGRESS_TTL)
             pipe.expire(log_key, _PROGRESS_TTL)
+            # Wake any live ``subscribe_progress`` tailers. The publish is
+            # part of the same pipeline so a subscriber that re-reads on
+            # wake is guaranteed to see the appended entry.
+            pipe.publish(self._progress_channel(task_id), str(seq))
             await pipe.execute()
         return seq
 
@@ -199,6 +211,41 @@ class RedisTaskStore(TaskStore):
             except (ValueError, AttributeError):
                 log.warning("Skipping malformed progress entry for task_id=%s", task_id)
         return entries
+
+    async def subscribe_progress(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> AsyncIterator[ProgressEntry]:
+        """Live-tail progress for ``task_id`` via Redis pub/sub.
+
+        Each ``append_progress`` PUBLISHes the new seq on the per-task
+        channel; on every wake the subscriber re-reads the log past
+        ``last_seq``. ``get_message`` with a short timeout keeps the
+        async loop responsive to cancellation.
+        """
+        pubsub = self._r.pubsub()
+        channel = self._progress_channel(task_id)
+        await pubsub.subscribe(channel)
+        try:
+            last_seq = since_seq
+            for entry in await self.read_progress(task_id, last_seq):
+                last_seq = entry.seq
+                yield entry
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=5.0,
+                )
+                if message is None or message.get("type") != "message":
+                    continue
+                for entry in await self.read_progress(task_id, last_seq):
+                    last_seq = entry.seq
+                    yield entry
+        finally:
+            with contextlib.suppress(Exception):
+                await pubsub.unsubscribe(channel)
+            with contextlib.suppress(Exception):
+                await pubsub.aclose()
 
     async def clear_progress(self, task_id: str) -> None:
         async with self._r.pipeline(transaction=True) as pipe:
