@@ -15,6 +15,7 @@ from .route import (
     build_a2a_app,
     build_invoke,
     build_stream_invoke,
+    clean_up_stale_tasks,
     format_history,
     get_task_history,
     get_user_input,
@@ -33,6 +34,8 @@ from .utils import report_progress
 __all__ = [
     # App factory
     "build_a2a_app",
+    # Startup recovery helper
+    "clean_up_stale_tasks",
     # Invoke wrappers
     "build_invoke",
     "build_stream_invoke",

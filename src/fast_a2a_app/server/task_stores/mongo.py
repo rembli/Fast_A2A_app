@@ -39,15 +39,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 
 from google.protobuf.json_format import MessageToJson, Parse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from a2a.helpers import new_text_message
 from a2a.server.tasks import TaskStore
-from a2a.types import ListTasksRequest, ListTasksResponse, Task
+from a2a.types import Artifact, ListTasksRequest, ListTasksResponse, Task, TaskState
 
 from ._types import ProgressEntry
+
+_TERMINAL_TASK_STATES = frozenset({
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+})
 
 log = logging.getLogger(__name__)
 
@@ -316,6 +324,88 @@ class MongoTaskStore(TaskStore):
         if document is None:
             return None
         return document.get("ts")
+
+    async def finalize_task(
+        self,
+        task_id: str,
+        *,
+        state: TaskState,
+        status_message: str | None = None,
+        artifacts: Iterable[Artifact] | None = None,
+    ) -> bool:
+        """Atomic-ish terminal write — read, mutate, replace, then drop progress.
+
+        Idempotent: returns ``False`` if the task is missing or already in
+        a terminal state. Race window between the read and the replace is
+        bounded by the idempotency rule.
+        """
+        await self.ensure_indexes()
+        document = await self._tasks.find_one(
+            {"_id": task_id}, projection={"task_json": 1, "context_id": 1},
+        )
+        if document is None:
+            return False
+        try:
+            task = Parse(document["task_json"], Task())
+        except Exception:
+            log.exception("finalize_task: corrupted payload for %s", task_id)
+            return False
+        if task.status.state in _TERMINAL_TASK_STATES:
+            return False
+        task.status.state = state
+        if status_message is not None:
+            task.status.message.CopyFrom(new_text_message(
+                status_message,
+                context_id=task.context_id or None,
+                task_id=task.id,
+            ))
+        if artifacts:
+            task.artifacts.extend(artifacts)
+
+        expires_at = _utcnow() + timedelta(seconds=_TTL_SECONDS)
+        await self._tasks.replace_one(
+            {"_id": task_id},
+            {
+                "_id": task_id,
+                "task_json": MessageToJson(task),
+                "context_id": document.get("context_id"),
+                "expires_at": expires_at,
+            },
+            upsert=True,
+        )
+        await self._progress.delete_many({"task_id": task_id})
+        await self._progress_heartbeats.delete_one({"_id": task_id})
+        return True
+
+    async def list_stale_working_tasks(self, threshold_secs: float) -> list[str]:
+        """Find WORKING tasks whose latest heartbeat is older than the threshold.
+
+        We sweep ``progress_heartbeats`` (TTL-pruned, small) and confirm the
+        task is still WORKING before listing it — concurrent finalize calls
+        may have already moved a task to terminal without clearing the
+        heartbeat document yet.
+        """
+        await self.ensure_indexes()
+        now_ts = time.time()
+        cutoff = now_ts - threshold_secs
+        stale: list[str] = []
+        hb_cursor = self._progress_heartbeats.find(
+            {"ts": {"$lt": cutoff}}, projection={"_id": 1},
+        )
+        candidate_ids = [doc["_id"] async for doc in hb_cursor]
+        if not candidate_ids:
+            return stale
+        task_cursor = self._tasks.find(
+            {"_id": {"$in": candidate_ids}}, projection={"_id": 1, "task_json": 1},
+        )
+        async for document in task_cursor:
+            try:
+                task = Parse(document["task_json"], Task())
+            except Exception:
+                continue
+            if task.status.state == TaskState.TASK_STATE_WORKING:
+                stale.append(document["_id"])
+        return stale
 
     async def list_by_context(
         self,

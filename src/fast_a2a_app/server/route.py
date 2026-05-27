@@ -694,8 +694,9 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
        event is ever emitted). On ``GetTask`` / ``SubscribeToTask`` we check
        the per-task heartbeat written by ``ConfigurableAgentExecutor``; if
        it's older than ``_STALE_THRESHOLD`` and no replica is currently
-       running the task, we flip the stored task to ``TASK_STATE_FAILED``
-       so the UI sees a terminal state.
+       running the task, we route the task through ``on_task_recover`` (if
+       configured) or default-finalize it as ``TASK_STATE_FAILED`` so the
+       UI sees a terminal state.
 
     2. **Lost progress.** ``report_progress(...)`` strings live only in
        the executor's in-memory SSE queue. A network blip, a tab refresh,
@@ -705,7 +706,9 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
        it left off when ``resubscribeTaskStream()`` reconnects.
 
     Both checks are lazy — no background sweeper. The next request from
-    a client is what triggers the FAILED transition.
+    a client is what triggers the FAILED transition. Pair with
+    :func:`clean_up_stale_tasks` (called from app lifespan startup) to
+    also cover the no-traffic case after a restart.
     """
 
     def __init__(
@@ -714,6 +717,7 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
         agent_executor: ConfigurableAgentExecutor,
         task_store: A2ATaskStore,
         progress_store: A2ATaskStore,
+        on_task_recover: Callable[[str], Awaitable[None]] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -726,6 +730,7 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
         # ``self.task_store`` is the extended ``A2ATaskStore`` Protocol (the
         # SDK base class types it as the narrower SDK ``TaskStore``).
         self._progress_store: A2ATaskStore = progress_store
+        self._on_task_recover = on_task_recover
 
     async def _is_stale(self, task_id: str) -> bool:
         """True if the task has a heartbeat older than ``_STALE_THRESHOLD``.
@@ -743,19 +748,40 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
             return False
         return (time.time() - hb) > _STALE_THRESHOLD
 
-    async def _mark_failed_after_crash(self, task: Task, context) -> Task:
-        """Persist TASK_STATE_FAILED on a task whose worker died mid-flight."""
-        task.status.state = TaskState.TASK_STATE_FAILED
-        failure_message = new_text_message(
-            "Agent worker stopped unexpectedly. Please retry.",
-            context_id=task.context_id,
-            task_id=task.id,
-        )
-        task.status.message.CopyFrom(failure_message)
+    async def _recover_stuck_task(self, task: Task, context) -> Task:
+        """Settle a task whose worker died mid-flight.
+
+        Calls ``on_task_recover`` first (best-effort, advisory) so a
+        custom hook can do agent-side cleanup — e.g. cancel a still-
+        pending durable workflow, emit telemetry, write a tailored
+        status message via ``finalize_task``. The framework then
+        default-finalizes as ``TASK_STATE_FAILED`` via
+        ``finalize_task``, which is idempotent: a hook that already
+        wrote a terminal state leaves it intact.
+
+        Returns the task in its post-recovery state. The original
+        ``task`` argument is returned unchanged on any error so the
+        caller still has something to yield.
+        """
+        if self._on_task_recover is not None:
+            try:
+                await self._on_task_recover(task.id)
+            except Exception:
+                log.exception(
+                    "on_task_recover hook failed for task=%s — falling through to default finalize",
+                    task.id,
+                )
+
         with contextlib.suppress(Exception):
-            await self._progress_store.save(task, context)
+            await self._progress_store.finalize_task(
+                task.id,
+                state=TaskState.TASK_STATE_FAILED,
+                status_message="Agent worker stopped unexpectedly. Please retry.",
+            )
         with contextlib.suppress(Exception):
-            await self._progress_store.clear_progress(task.id)
+            refreshed = await self._progress_store.get(task.id, context)
+            if refreshed is not None:
+                return refreshed
         return task
 
     def _progress_to_event(
@@ -795,7 +821,7 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
             and not self._executor.is_running_locally(task.id)
             and await self._is_stale(task.id)
         ):
-            task = await self._mark_failed_after_crash(task, context)
+            task = await self._recover_stuck_task(task, context)
         return task
 
     @validate_request_params
@@ -832,16 +858,17 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
             yield task
             return
 
-        # WORKING but worker is gone — surface FAILED. Yielding both the
-        # full Task (so the UI's transcript stays in sync) and an explicit
-        # status update lets ``processStreamPayload`` raise immediately
-        # instead of waiting for the snapshot fallback to detect it.
+        # WORKING but worker is gone — recover (custom hook or default
+        # FAILED). Yielding both the full Task (so the UI's transcript
+        # stays in sync) and an explicit status update lets
+        # ``processStreamPayload`` raise immediately instead of waiting
+        # for the snapshot fallback to detect it.
         if (
             state == TaskState.TASK_STATE_WORKING
             and not self._executor.is_running_locally(task_id)
             and await self._is_stale(task_id)
         ):
-            task = await self._mark_failed_after_crash(task, context)
+            task = await self._recover_stuck_task(task, context)
             yield task
             yield TaskStatusUpdateEvent(
                 task_id=task.id,
@@ -1057,6 +1084,69 @@ def build_stream_invoke(
     return _stream
 
 
+async def clean_up_stale_tasks(
+    task_store: A2ATaskStore,
+    *,
+    on_task_recover: Callable[[str], Awaitable[None]] | None = None,
+    threshold_secs: float = _STALE_THRESHOLD,
+) -> list[str]:
+    """Finalize tasks left WORKING by a previous process.
+
+    Call this from your app's lifespan startup (after the task store is
+    open) so a crashed-then-restarted process unsticks any tasks the
+    UI is still polling on:
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            store = await PostgresTaskStore.from_dsn(POSTGRES_URL)
+            await clean_up_stale_tasks(store, on_task_recover=my_recover_hook)
+            ...
+
+    For each stale task ``on_task_recover(task_id)`` is invoked first
+    (best-effort, advisory) so the agent can do its own cleanup —
+    cancel a stuck durable workflow, emit telemetry, write a tailored
+    status message via ``finalize_task``. The framework then calls
+    ``task_store.finalize_task(... TASK_STATE_FAILED)``, which is
+    idempotent at the store layer: a hook that already wrote a
+    terminal state leaves it intact.
+
+    Returns the list of task_ids the function touched.
+    """
+    try:
+        stale = await task_store.list_stale_working_tasks(threshold_secs)
+    except Exception:
+        log.exception("clean_up_stale_tasks: list_stale_working_tasks failed")
+        return []
+
+    if not stale:
+        return []
+
+    log.info(
+        "clean_up_stale_tasks: %d stuck task(s) detected — recovering",
+        len(stale),
+    )
+    for task_id in stale:
+        if on_task_recover is not None:
+            try:
+                await on_task_recover(task_id)
+            except Exception:
+                log.exception(
+                    "clean_up_stale_tasks: on_task_recover failed task=%s — falling through to default finalize",
+                    task_id,
+                )
+        try:
+            await task_store.finalize_task(
+                task_id,
+                state=TaskState.TASK_STATE_FAILED,
+                status_message="Task interrupted during a restart. Please re-ask.",
+            )
+        except Exception:
+            log.exception(
+                "clean_up_stale_tasks: finalize_task failed task=%s", task_id,
+            )
+    return stale
+
+
 def build_a2a_app(
     *,
     agent_card: AgentCard,
@@ -1070,6 +1160,7 @@ def build_a2a_app(
     prompt_builder: Callable[[RequestContext], str] | None = None,
     on_task_start: Callable[[str], Awaitable[None]] | None = None,
     on_task_cancel: Callable[[str, str], Awaitable[None]] | None = None,
+    on_task_recover: Callable[[str], Awaitable[None]] | None = None,
     task_store: A2ATaskStore | None = None,
     debug: bool = False,
 ):
@@ -1144,6 +1235,16 @@ def build_a2a_app(
     in-process :class:`MemoryTaskStore` is used — zero infrastructure,
     suitable for development and single-process deployments only.
 
+    ``on_task_recover(task_id)`` is an async, advisory hook called
+    whenever the framework detects a stuck WORKING task whose worker
+    has died (lazy on ``GetTask`` / ``SubscribeToTask``, eager from
+    :func:`clean_up_stale_tasks` at startup). Use it for agent-side
+    cleanup — cancelling a stuck durable workflow, emitting telemetry,
+    optionally writing a tailored status message via
+    ``finalize_task``. After the hook returns the framework
+    default-finalizes the task as ``TASK_STATE_FAILED`` (no-op if the
+    hook already wrote a terminal state), so the UI always unsticks.
+
     Set ``debug=True`` to include exception details in agent failure messages.
     """
     resolved_prompt_builder = prompt_builder or _make_default_prompt_builder(
@@ -1164,6 +1265,7 @@ def build_a2a_app(
         agent_executor=executor,
         task_store=resolved_store,
         progress_store=resolved_store,
+        on_task_recover=on_task_recover,
         agent_card=agent_card,
         request_context_builder=ContextAwareRequestContextBuilder(resolved_store),
     )

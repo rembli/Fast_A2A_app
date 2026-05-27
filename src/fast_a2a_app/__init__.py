@@ -75,6 +75,7 @@ from .server import (
     build_a2a_app,
     build_invoke,
     build_stream_invoke,
+    clean_up_stale_tasks,
     data_artifact,
     file_artifact,
     format_history,
@@ -94,6 +95,7 @@ __all__ = [
     "build_a2a_app",
     "build_invoke",
     "build_stream_invoke",
+    "clean_up_stale_tasks",
     # Prompt helpers (Level 2 building blocks)
     "get_task_history",
     "format_history",

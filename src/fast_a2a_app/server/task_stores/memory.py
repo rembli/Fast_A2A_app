@@ -26,13 +26,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 
 from google.protobuf.json_format import MessageToJson, Parse
+from a2a.helpers import new_text_message
 from a2a.server.tasks import TaskStore
-from a2a.types import ListTasksRequest, ListTasksResponse, Task
+from a2a.types import Artifact, ListTasksRequest, ListTasksResponse, Task, TaskState
 
 from ._types import ProgressEntry
+
+_TERMINAL_TASK_STATES = frozenset({
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+})
 
 log = logging.getLogger(__name__)
 
@@ -227,6 +235,66 @@ class MemoryTaskStore(TaskStore):
     async def get_heartbeat(self, task_id: str) -> float | None:
         async with self._lock:
             return self._heartbeats.get(task_id)
+
+    async def finalize_task(
+        self,
+        task_id: str,
+        *,
+        state: TaskState,
+        status_message: str | None = None,
+        artifacts: Iterable[Artifact] | None = None,
+    ) -> bool:
+        """Atomically write a terminal state under ``self._lock``.
+
+        Idempotent: returns ``False`` if the task is missing or already in a
+        terminal state, leaving the existing record untouched.
+        """
+        async with self._lock:
+            payload = self._tasks.get(task_id)
+            if payload is None:
+                return False
+            try:
+                task = Parse(payload, Task())
+            except Exception:
+                log.exception(
+                    "finalize_task: corrupted payload for %s", task_id,
+                )
+                return False
+            if task.status.state in _TERMINAL_TASK_STATES:
+                return False
+            task.status.state = state
+            if status_message is not None:
+                task.status.message.CopyFrom(new_text_message(
+                    status_message,
+                    context_id=task.context_id or None,
+                    task_id=task.id,
+                ))
+            if artifacts:
+                task.artifacts.extend(artifacts)
+            self._tasks[task_id] = MessageToJson(task)
+            self._progress_log.pop(task_id, None)
+            self._progress_seq.pop(task_id, None)
+            self._heartbeats.pop(task_id, None)
+            return True
+
+    async def list_stale_working_tasks(self, threshold_secs: float) -> list[str]:
+        """Scan the in-memory task table for WORKING tasks past the threshold."""
+        now = _utcnow()
+        stale: list[str] = []
+        async with self._lock:
+            task_items = list(self._tasks.items())
+            heartbeats = dict(self._heartbeats)
+        for task_id, payload in task_items:
+            try:
+                task = Parse(payload, Task())
+            except Exception:
+                continue
+            if task.status.state != TaskState.TASK_STATE_WORKING:
+                continue
+            hb = heartbeats.get(task_id)
+            if hb is None or (now - hb) > threshold_secs:
+                stale.append(task_id)
+        return stale
 
     async def list_by_context(
         self,

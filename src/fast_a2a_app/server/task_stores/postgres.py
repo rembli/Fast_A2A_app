@@ -50,15 +50,23 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from google.protobuf.json_format import MessageToJson, Parse
+from a2a.helpers import new_text_message
 from a2a.server.tasks import TaskStore
-from a2a.types import ListTasksRequest, ListTasksResponse, Task
+from a2a.types import Artifact, ListTasksRequest, ListTasksResponse, Task, TaskState
 
 from ._types import ProgressEntry
+
+_TERMINAL_TASK_STATES = frozenset({
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+})
 
 log = logging.getLogger(__name__)
 
@@ -388,6 +396,98 @@ class PostgresTaskStore(TaskStore):
             task_id,
         )
         return value
+
+    async def finalize_task(
+        self,
+        task_id: str,
+        *,
+        state: TaskState,
+        status_message: str | None = None,
+        artifacts: Iterable[Artifact] | None = None,
+    ) -> bool:
+        """Atomic terminal write inside a single transaction.
+
+        Uses ``SELECT ... FOR UPDATE`` so concurrent finalizers serialize on
+        the task row; the in-flight transaction sees the most recent state,
+        short-circuits if already terminal, and commits the new payload +
+        progress cleanup together.
+        """
+        await self.ensure_schema()
+        new_payload: str | None = None
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    "SELECT task_json, context_id, expires_at "
+                    "FROM a2a_tasks WHERE id = $1 FOR UPDATE",
+                    task_id,
+                )
+                if row is None:
+                    return False
+                try:
+                    task = Parse(row["task_json"], Task())
+                except Exception:
+                    log.exception(
+                        "finalize_task: corrupted payload for %s", task_id,
+                    )
+                    return False
+                if task.status.state in _TERMINAL_TASK_STATES:
+                    return False
+                task.status.state = state
+                if status_message is not None:
+                    task.status.message.CopyFrom(new_text_message(
+                        status_message,
+                        context_id=task.context_id or None,
+                        task_id=task.id,
+                    ))
+                if artifacts:
+                    task.artifacts.extend(artifacts)
+                new_payload = MessageToJson(task)
+                await connection.execute(
+                    "UPDATE a2a_tasks SET task_json = $1, expires_at = $2 "
+                    "WHERE id = $3",
+                    new_payload,
+                    _utcnow() + timedelta(seconds=_TTL_SECONDS),
+                    task_id,
+                )
+                await connection.execute(
+                    "DELETE FROM a2a_progress WHERE task_id = $1", task_id,
+                )
+                await connection.execute(
+                    "DELETE FROM a2a_progress_heartbeats WHERE task_id = $1",
+                    task_id,
+                )
+        return True
+
+    async def list_stale_working_tasks(self, threshold_secs: float) -> list[str]:
+        """Find WORKING tasks whose heartbeat is older than the threshold.
+
+        Joins ``a2a_progress_heartbeats`` (small, TTL-bounded) against
+        ``a2a_tasks`` so the scan only inspects tasks with recorded
+        heartbeats; tasks WORKING but never ticked won't appear here, but
+        the request-handler's lazy stale-detection still catches them on
+        the next GetTask.
+        """
+        await self.ensure_schema()
+        cutoff = time.time() - threshold_secs
+        rows = await self._pool.fetch(
+            """
+            SELECT t.id, t.task_json
+            FROM a2a_tasks t
+            JOIN a2a_progress_heartbeats h ON h.task_id = t.id
+            WHERE h.ts < $1
+              AND t.expires_at > NOW()
+            """,
+            cutoff,
+        )
+        stale: list[str] = []
+        for row in rows:
+            try:
+                task = Parse(row["task_json"], Task())
+            except Exception:
+                continue
+            if task.status.state == TaskState.TASK_STATE_WORKING:
+                stale.append(row["id"])
+        return stale
 
     async def list_by_context(
         self,

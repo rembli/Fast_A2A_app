@@ -27,12 +27,13 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 
 import redis.asyncio as aioredis
 from google.protobuf.json_format import MessageToJson, Parse
+from a2a.helpers import new_text_message
 from a2a.server.tasks import TaskStore
-from a2a.types import ListTasksRequest, ListTasksResponse, Task
+from a2a.types import Artifact, ListTasksRequest, ListTasksResponse, Task, TaskState
 
 from ._types import ProgressEntry
 
@@ -41,6 +42,14 @@ log = logging.getLogger(__name__)
 _TTL = 86_400          # 24 h
 _CANCEL_SIGNAL_TTL = 300  # 5 min
 _PROGRESS_TTL = 86_400  # 24 h — matches task TTL
+_STALE_SCAN_BATCH = 256  # SCAN page size when sweeping heartbeats
+
+_TERMINAL_TASK_STATES = frozenset({
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+})
 
 
 class RedisTaskStore(TaskStore):
@@ -265,6 +274,104 @@ class RedisTaskStore(TaskStore):
             return float(value)
         except ValueError:
             return None
+
+    async def finalize_task(
+        self,
+        task_id: str,
+        *,
+        state: TaskState,
+        status_message: str | None = None,
+        artifacts: Iterable[Artifact] | None = None,
+    ) -> bool:
+        """Atomic-ish terminal write.
+
+        Reads the current task, short-circuits if already terminal, mutates
+        the protobuf in memory, then writes the new payload and clears the
+        progress log in a single Redis pipeline. The read-then-write window
+        is not transactional but races are bounded by the idempotency rule:
+        a concurrent finalize that wins first leaves the loser as a no-op
+        on its retry (current state is read again from the store).
+        """
+        payload = await self._r.get(self._task_key(task_id))
+        if payload is None:
+            return False
+        try:
+            task = Parse(payload, Task())
+        except Exception:
+            log.exception("finalize_task: corrupted payload for %s", task_id)
+            return False
+        if task.status.state in _TERMINAL_TASK_STATES:
+            return False
+        task.status.state = state
+        if status_message is not None:
+            task.status.message.CopyFrom(new_text_message(
+                status_message,
+                context_id=task.context_id or None,
+                task_id=task.id,
+            ))
+        if artifacts:
+            task.artifacts.extend(artifacts)
+
+        async with self._r.pipeline(transaction=True) as pipe:
+            pipe.set(self._task_key(task_id), MessageToJson(task), ex=_TTL)
+            pipe.delete(self._progress_log_key(task_id))
+            pipe.delete(self._progress_seq_key(task_id))
+            pipe.delete(self._progress_hb_key(task_id))
+            await pipe.execute()
+        return True
+
+    async def list_stale_working_tasks(self, threshold_secs: float) -> list[str]:
+        """SCAN heartbeat keys, return WORKING task_ids whose hb is stale.
+
+        Heartbeat keys are the right sweep target because they carry a TTL
+        that already prunes old data — the scan only walks active or
+        recently-active tasks, never the full task space.
+        """
+        now = time.time()
+        hb_prefix = "a2a:progress:"
+        hb_suffix = ":hb"
+        stale: list[str] = []
+        cursor = 0
+        while True:
+            cursor, keys = await self._r.scan(
+                cursor=cursor,
+                match=f"{hb_prefix}*{hb_suffix}",
+                count=_STALE_SCAN_BATCH,
+            )
+            if not keys:
+                if cursor == 0:
+                    break
+                continue
+            values = await self._r.mget(keys)
+            for key, raw_hb in zip(keys, values):
+                # Recover task_id from key shape "a2a:progress:{task_id}:hb"
+                task_id = key[len(hb_prefix):-len(hb_suffix)]
+                try:
+                    hb = float(raw_hb) if raw_hb is not None else None
+                except ValueError:
+                    hb = None
+                if hb is not None and (now - hb) <= threshold_secs:
+                    continue
+                # Confirm the task is still WORKING (not terminal) before
+                # listing it — otherwise we'd hand back already-finalized
+                # tasks whose heartbeat hasn't been TTL'd yet.
+                payload = await self._r.get(self._task_key(task_id))
+                if payload is None:
+                    continue
+                try:
+                    task = Parse(payload, Task())
+                except Exception:
+                    continue
+                if task.status.state == TaskState.TASK_STATE_WORKING:
+                    stale.append(task_id)
+            if cursor == 0:
+                break
+
+        # Tasks WORKING with no heartbeat at all (heartbeat key never written
+        # or already TTL'd) won't appear in the heartbeat scan above. We
+        # don't attempt a full task-space scan here — the request-handler's
+        # lazy stale-detection still catches these on the next GetTask.
+        return stale
 
     async def list_by_context(
         self,

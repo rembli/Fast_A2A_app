@@ -22,9 +22,9 @@ instance to ``build_a2a_app(task_store=...)``.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Iterable, Protocol
 
-from a2a.types import ListTasksRequest, ListTasksResponse, Task
+from a2a.types import Artifact, ListTasksRequest, ListTasksResponse, Task, TaskState
 
 from ._types import ProgressEntry
 from .memory import MemoryTaskStore
@@ -55,6 +55,45 @@ class A2ATaskStore(Protocol):
     ) -> list[Task]: ...
     async def signal_cancel(self, task_id: str) -> None: ...
     async def is_cancel_signalled(self, task_id: str) -> bool: ...
+
+    # ── Terminal finalize + stale scan ────────────────────────────────────────
+    # ``finalize_task`` is the single durable path for writing a terminal
+    # state. Callers include the framework's crash-recovery sweeper and
+    # whatever agent-side hook the user wires via ``on_task_recover``.
+    # Idempotent: a task already in a terminal state is left alone, so
+    # racing finalizers don't clobber each other.
+
+    async def finalize_task(
+        self,
+        task_id: str,
+        *,
+        state: TaskState,
+        status_message: str | None = None,
+        artifacts: Iterable[Artifact] | None = None,
+    ) -> bool:
+        """Atomically transition ``task_id`` to ``state`` and clear progress.
+
+        Returns ``True`` if the task was transitioned by this call, ``False``
+        if the task is missing or already terminal (no-op). Callers can rely
+        on the boolean to decide whether to log the transition.
+
+        ``status_message`` is wrapped as a single-text-part ``Message`` on
+        ``task.status.message`` so the UI can surface a recovery reason.
+        Any ``artifacts`` are appended to ``task.artifacts``.
+        """
+        ...
+
+    async def list_stale_working_tasks(
+        self,
+        threshold_secs: float,
+    ) -> list[str]:
+        """Return task_ids in WORKING state whose heartbeat is older than
+        ``threshold_secs`` (or absent entirely).
+
+        Used by the startup sweeper to find tasks that were mid-flight when
+        the process died and need a terminal write so the UI unsticks.
+        """
+        ...
 
     # ── Progress log + worker heartbeat ───────────────────────────────────────
     # Backends persist progress events so they survive a worker crash. On
