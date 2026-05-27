@@ -5,4 +5,4 @@ Hatchling reads ``__version__`` from this file at build time (see
 it directly, so editing the constant below propagates to both the
 installed metadata and the chat UI without further bookkeeping.
 """
-__version__ = "0.6.16"
+__version__ = "0.6.17"

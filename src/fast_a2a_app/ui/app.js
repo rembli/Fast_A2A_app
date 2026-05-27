@@ -789,9 +789,32 @@ async function fetchTask(taskId) {
 
 async function resumeActiveTaskOnLoad() {
   const activeTask = getActiveTask();
-  if (!activeTask || activeTask.contextId !== contextId || busy) return;
+  console.log('%c[RESUME] page load', 'color: #c026d3; font-weight: bold',
+    { activeTask, contextId, busy });
+  if (!activeTask || activeTask.contextId !== contextId || busy) {
+    console.log('%c[RESUME] bailing early', 'color: #c026d3', {
+      reason: !activeTask ? 'no activeTask'
+        : activeTask.contextId !== contextId ? `contextId mismatch ${activeTask.contextId} != ${contextId}`
+        : 'busy',
+    });
+    return;
+  }
 
   const snapshot = await fetchTask(activeTask.taskId).catch(() => null);
+  console.log('%c[RESUME] GetTask snapshot', 'color: #c026d3; font-weight: bold', {
+    state: snapshot?.status?.state,
+    artifactCount: snapshot?.artifacts?.length || 0,
+    artifactNames: (snapshot?.artifacts || []).map(a => a.name),
+    artifactPartKinds: (snapshot?.artifacts || []).map(a =>
+      (a.parts || []).map(p =>
+        p.text ? 'text'
+          : ('data' in p) ? `data[_type=${p.data?._type || '?'}]`
+          : ('raw' in p) ? 'raw'
+          : p.url ? 'url'
+          : 'unknown'
+      )
+    ),
+  });
   if (!snapshot) { clearActiveTask(); return; }
   const snapState = snapshot.status?.state;
   if (snapState === 'TASK_STATE_FAILED' || snapState === 'TASK_STATE_CANCELED') {
@@ -810,6 +833,9 @@ async function resumeActiveTaskOnLoad() {
     const existingBubble = lastEntry?.role === 'agent'
       ? findTranscriptBubble(lastEntry.id)
       : null;
+    console.log('%c[RESUME] dispatching to displayTaskMessages', 'color: #c026d3', {
+      existingBubble: !!existingBubble, lastEntryRole: lastEntry?.role,
+    });
     displayTaskMessages(snapshot, existingBubble);
     clearActiveTask();
     return;
@@ -1095,10 +1121,11 @@ function agentStatusText(event) {
  * Renders the completed task response. Handles three cases:
  *   1. No artifact parts → fall back to agent history text
  *   2. Text-only parts   → existing markdown bubble
- *   3. Mixed parts       → multi-part bubble (text + data + file widgets)
+ *   3. Mixed parts       → one bubble per artifact, mirroring the live stream
  */
 function displayTaskMessages(task, existingBubble = null) {
-  const allParts = (task.artifacts || []).flatMap(a => a.parts || []);
+  const artifacts = (task.artifacts || []).filter(a => (a.parts || []).length > 0);
+  const allParts = artifacts.flatMap(a => a.parts || []);
 
   // No artifact parts — fall back to history
   if (allParts.length === 0) {
@@ -1118,41 +1145,52 @@ function displayTaskMessages(task, existingBubble = null) {
   }
 
   const richPresent = allParts.some(p => 'data' in p || 'raw' in p || p.url);
-  // Chunks of the *same* artifact (e.g. streamed text fragments) concatenate
-  // verbatim — the streaming layer already inserted whatever inter-chunk
-  // spacing it wanted. Only the boundaries between *distinct* artifacts get
-  // a paragraph break, so a multi-chunk response doesn't render as one
-  // <p> per chunk (which is what made each word appear on its own line for
-  // word-streaming agents like echo_agent under non-streaming mode).
-  const textContent = (task.artifacts || [])
-    .map(a => (a.parts || [])
-      .filter(p => typeof p.text === 'string' && p.text)
-      .map(p => p.text)
-      .join('')
-    )
-    .map(t => t.trim())
-    .filter(Boolean)
-    .join('\n\n');
 
   if (!richPresent) {
-    // Text-only artifact
+    // Text-only — concatenate text across artifacts into a single bubble.
+    const textContent = artifacts
+      .map(a => (a.parts || [])
+        .filter(p => typeof p.text === 'string' && p.text)
+        .map(p => p.text)
+        .join('')
+      )
+      .map(t => t.trim())
+      .filter(Boolean)
+      .join('\n\n');
     const responseText = textContent || '(no response)';
     if (existingBubble) { renderAgentBubble(existingBubble, responseText); return; }
     agentMsg(responseText);
     return;
   }
 
-  // Multi-part
-  if (existingBubble) {
-    renderAgentBubbleParts(existingBubble, allParts, task.id || null);
-    persistAgentParts(existingBubble.dataset.transcriptId, textContent, allParts);
-  } else {
-    agentMsgParts(allParts, textContent, task.id || null);
+  // Multi-part: render one bubble per artifact. This matches the live-stream
+  // path (each TaskArtifactUpdateEvent gets its own bubble) so renderers that
+  // hide their own wrap (e.g. DOCUMENTS) only hide the bubble containing
+  // their own data — sibling artifacts (text reply, DOCUMENT card,
+  // PROMPT_SUGGESTIONS chips) stay visible.
+  const taskId = task.id || null;
+  let bubbleForFirst = existingBubble;
+  for (const artifact of artifacts) {
+    const parts = artifact.parts || [];
+    if (parts.length === 0) continue;
+    const artifactText = parts
+      .filter(p => typeof p.text === 'string' && p.text)
+      .map(p => p.text)
+      .join('')
+      .trim();
+
+    if (bubbleForFirst) {
+      renderAgentBubbleParts(bubbleForFirst, parts, taskId);
+      persistAgentParts(bubbleForFirst.dataset.transcriptId, artifactText, parts);
+      bubbleForFirst = null;
+    } else {
+      agentMsgParts(parts, artifactText, taskId);
+    }
   }
   // Pick up any closing PROMPT_SUGGESTIONS the snapshot includes so the
   // fullscreen overlay can surface them on this turn's images.
-  if (task.id) {
-    recordPromptSuggestionsFromParts(task.id, allParts);
+  if (taskId) {
+    recordPromptSuggestionsFromParts(taskId, allParts);
   }
 }
 

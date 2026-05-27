@@ -72,6 +72,7 @@ from .server import (
     PostgresTaskStore,
     RedisTaskStore,
     artifact_types,
+    bind_executor,
     build_a2a_app,
     build_invoke,
     build_stream_invoke,
@@ -96,6 +97,7 @@ __all__ = [
     "build_invoke",
     "build_stream_invoke",
     "clean_up_stale_tasks",
+    "bind_executor",
     # Prompt helpers (Level 2 building blocks)
     "get_task_history",
     "format_history",

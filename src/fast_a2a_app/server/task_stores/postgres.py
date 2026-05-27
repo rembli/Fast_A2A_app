@@ -273,12 +273,25 @@ class PostgresTaskStore(TaskStore):
     # ── Progress log + heartbeat ──────────────────────────────────────────────
 
     async def append_progress(self, task_id: str, message: str) -> int:
-        """Allocate the next seq, insert the entry, and bump the heartbeat."""
+        """Allocate the next seq, insert the entry, and bump the heartbeat.
+
+        ``report_progress`` is fire-and-forget (``loop.create_task``), so
+        multiple progress writes for the same task can race: two concurrent
+        transactions each compute ``SELECT MAX(seq)+1``, see the same
+        value, and the second INSERT trips the ``a2a_progress_pkey``
+        unique constraint. We serialise per-task with a transaction-scoped
+        advisory lock — concurrent writes for the *same* task queue up,
+        writes for different tasks remain fully parallel.
+        """
         await self.ensure_schema()
         now = time.time()
         expires_at = _utcnow() + timedelta(seconds=_PROGRESS_TTL_SECONDS)
         async with self._pool.acquire() as connection:
             async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    task_id,
+                )
                 seq = await connection.fetchval(
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM a2a_progress "
                     "WHERE task_id = $1",

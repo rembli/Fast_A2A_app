@@ -534,11 +534,27 @@ class ConfigurableAgentExecutor(AgentExecutor):
             if progress_task is not None:
                 progress_task.cancel()
             if self._task_store and task_id:
-                # Drop the persisted progress log now that the task has
-                # reached a terminal state — no further replay is useful and
-                # we don't want to leak rows up to the 24 h TTL.
-                with contextlib.suppress(Exception):
-                    await self._task_store.clear_progress(task_id)
+                # Only drop the persisted progress log + heartbeat if the
+                # task actually reached a terminal state. On graceful
+                # shutdown (SIGINT/SIGTERM) the agent coroutine is cancelled
+                # mid-flight: the CANCELED status update enqueued above may
+                # not flush to the store before the loop tears down, leaving
+                # the task in WORKING state in the DB. If we cleared the
+                # heartbeat here unconditionally, the stale-detector's
+                # ``list_stale_working_tasks`` JOIN against the heartbeat
+                # table would miss the orphaned task forever — recovery
+                # would never fire on the next boot. Keeping the heartbeat
+                # as a tombstone lets ``clean_up_stale_tasks`` find it.
+                try:
+                    final_task = await self._task_store.get(task_id)
+                except Exception:
+                    final_task = None
+                if (
+                    final_task is not None
+                    and final_task.status.state in _TERMINAL_TASK_STATES
+                ):
+                    with contextlib.suppress(Exception):
+                        await self._task_store.clear_progress(task_id)
             self._running_tasks.pop(task_id, None)
             self._task_contexts.pop(task_id, None)
             _current_task_id.reset(task_id_token)
@@ -924,9 +940,12 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
           pub/sub on Redis, in-process queue on Memory, poll on Mongo).
           Yielded as ``TaskStatusUpdateEvent`` so the UI's thinking
           indicator updates in real time.
-        * ``_poll_state`` — periodically re-reads the task; on terminal
-          we yield the fresh Task snapshot and return so the UI flips
-          out of WORKING.
+        * ``_poll_state`` — periodically re-reads the task and checks
+          the heartbeat. On terminal we yield the fresh Task snapshot
+          and return; if the heartbeat goes stale (worker died after
+          the client resubscribed) we trigger ``_recover_stuck_task``
+          and yield the resulting terminal snapshot so the UI flips
+          out of WORKING instead of polling forever.
         """
         task_id = task.id
         progress_iter = self._progress_store.subscribe_progress(task_id).__aiter__()
@@ -946,6 +965,17 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
                     return None
                 if current.status.state in _TERMINAL_TASK_STATES:
                     return current
+                # Worker died while the client was already subscribed:
+                # task is still WORKING in the store, but the heartbeat
+                # hasn't been refreshed past _STALE_THRESHOLD. Without
+                # this branch the resubscribe stream would hang
+                # indefinitely — _is_stale is only checked once before
+                # we enter this loop.
+                if (
+                    not self._executor.is_running_locally(task_id)
+                    and await self._is_stale(task_id)
+                ):
+                    return await self._recover_stuck_task(current, context)
 
         state_task = asyncio.create_task(_poll_state())
         next_entry_task = asyncio.create_task(progress_iter.__anext__())
@@ -1082,6 +1112,51 @@ def build_stream_invoke(
                 yield chunk
 
     return _stream
+
+
+@contextlib.asynccontextmanager
+async def bind_executor(task_id: str, task_store: A2ATaskStore):
+    """Re-bind ``report_progress`` for code running outside a normal request.
+
+    Sets the request-scoped ContextVars (``_current_executor`` and
+    ``_current_task_id``) so any ``report_progress(msg)`` call inside the
+    ``async with`` block — from tools, helpers, or ``asyncio.create_task``
+    children — writes to ``task_store.append_progress`` and reaches any
+    subscribed UI via the store's live-tail.
+
+    Use this from a custom :func:`on_task_recover` hook to actively
+    re-drive a stuck task after a worker crash. The hook reconstructs
+    the prompt + context, binds the executor, replays the agent
+    pipeline (with durable-execution caching providing idempotency where
+    available), collects yielded artifacts, and calls
+    ``task_store.finalize_task(state=COMPLETED, artifacts=...)`` at the
+    end. ``finalize_task`` is idempotent at the store layer, so the
+    framework's subsequent default-finalize-as-FAILED is a no-op once
+    the hook has settled the task::
+
+        async def recover_my_workflow(task_id: str, task_store):
+            task = await task_store.get(task_id)
+            ...
+            async with bind_executor(task_id, task_store):
+                report_progress("Resuming after restart…")
+                artifacts = []
+                async for chunk in stream_invoke(prompt, context):
+                    if isinstance(chunk, Artifact):
+                        artifacts.append(chunk)
+            await task_store.finalize_task(
+                task_id,
+                state=TaskState.TASK_STATE_COMPLETED,
+                artifacts=artifacts,
+            )
+    """
+    executor = ConfigurableAgentExecutor(task_store=task_store)
+    executor_token = _current_executor.set(executor)
+    task_id_token = _current_task_id.set(task_id)
+    try:
+        yield executor
+    finally:
+        _current_task_id.reset(task_id_token)
+        _current_executor.reset(executor_token)
 
 
 async def clean_up_stale_tasks(

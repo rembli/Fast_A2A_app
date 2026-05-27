@@ -12,6 +12,7 @@ from .artifacts import (
     text_artifact,
 )
 from .route import (
+    bind_executor,
     build_a2a_app,
     build_invoke,
     build_stream_invoke,
@@ -36,6 +37,8 @@ __all__ = [
     "build_a2a_app",
     # Startup recovery helper
     "clean_up_stale_tasks",
+    # Recovery-side ContextVar binding (re-binds report_progress)
+    "bind_executor",
     # Invoke wrappers
     "build_invoke",
     "build_stream_invoke",
