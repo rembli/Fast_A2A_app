@@ -799,6 +799,18 @@ async function resumeActiveTaskOnLoad() {
     return;
   }
   if (snapState === 'TASK_STATE_COMPLETED' || snapState === 'TASK_STATE_INPUT_REQUIRED') {
+    // Task completed while we were offline — typically after a host crash
+    // and durable-execution recovery finalized the task in the background.
+    // The localStorage transcript only has what streamed live before the
+    // disconnect, so anything finalize wrote after that point (text reply,
+    // inline DOCUMENT cards, follow-up suggestions) would be missing from
+    // the chat without this snapshot replay. Attach to the last agent
+    // bubble if one exists so we extend it rather than printing a new one.
+    const lastEntry = getLastTranscriptEntry();
+    const existingBubble = lastEntry?.role === 'agent'
+      ? findTranscriptBubble(lastEntry.id)
+      : null;
+    displayTaskMessages(snapshot, existingBubble);
     clearActiveTask();
     return;
   }
