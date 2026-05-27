@@ -743,6 +743,8 @@ build_a2a_app(
 )
 ```
 
+A third hook, `on_task_recover(task_id, task_store)`, fires when the framework detects a `TASK_STATE_WORKING` task whose worker has crashed — covered in [Durable agent execution with DBOS → Crash recovery](#crash-recovery).
+
 ---
 
 ## Choosing a task store
@@ -819,7 +821,7 @@ The framework gives you four primitives to plug DBOS into the A2A lifecycle. Ski
 ### Quickstart
 
 ```python
-from dbos import DBOS, DBOSConfig
+from dbos import DBOS, DBOSConfig, SetWorkflowID
 from pydantic_ai import Agent
 from pydantic_ai.durable_exec.dbos import DBOSAgent
 

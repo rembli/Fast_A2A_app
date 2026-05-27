@@ -382,6 +382,28 @@ class ArtifactType:
     builder: Callable[..., Artifact] | None = None      # optional Python helper
 ```
 
+### `clean_up_stale_tasks`
+
+```python
+async def clean_up_stale_tasks(
+    task_store: A2ATaskStore,
+    *,
+    on_task_recover: Callable[[str, A2ATaskStore], Awaitable[None]] | None = None,
+    threshold_secs: float = 30,
+) -> list[str]: ...
+```
+
+Sweeps the task store for `TASK_STATE_WORKING` tasks whose heartbeat is older than `threshold_secs` (default 30 s) and routes each through `on_task_recover` (if supplied) before default-finalizing them as `TASK_STATE_FAILED`. Call from app lifespan startup — after the task store opens and after `DBOS.launch()` — so a crashed-then-restarted process reconciles stuck tasks without waiting for a client to poll. Returns the list of `task_id`s touched. The same lazy heartbeat check fires on every `GetTask` / `SubscribeToTask`; `clean_up_stale_tasks` covers the no-traffic case. See [Crash recovery](how-to.md#crash-recovery).
+
+### `bind_executor`
+
+```python
+@contextlib.asynccontextmanager
+async def bind_executor(task_id: str, task_store: A2ATaskStore): ...
+```
+
+Async context manager that re-binds the request-scoped `ContextVar`s `report_progress(...)` reads (`_current_executor` + `_current_task_id`), so progress writes from inside the `async with` block land on `task_id` and reach any subscribed UI via the store's live-tail. Use it from a custom `on_task_recover` hook to actively re-drive a stuck task after a worker crash — see Policy B under [Crash recovery](how-to.md#crash-recovery). Outside a normal A2A request this is the only way to make `report_progress` non-silent.
+
 ---
 
 ## Versioning
