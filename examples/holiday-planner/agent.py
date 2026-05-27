@@ -113,11 +113,11 @@ class AgentDeps:
     it after ``agent.run()`` returns and yields each artifact into the
     A2A stream.
 
-    ``task_id`` is the A2A task identity, required by ``report_progress``
-    so the framework can route progress messages to the right task log.
+    Live status from inside tools goes through ``report_progress(msg)``,
+    which is request-scoped via a ContextVar set by ``build_stream_invoke``
+    — no task identity needs to be threaded through deps.
     """
 
-    task_id: str = ""
     generated: list[Artifact] = field(default_factory=list)
 
 
@@ -641,7 +641,7 @@ async def invoke(prompt: str, context: RequestContext) -> Artifact:
     are silently dropped because A2A's one-shot contract returns a
     single Artifact.
     """
-    deps = AgentDeps(task_id=context.task_id or "")
+    deps = AgentDeps()
     result = await holiday_agent.run(
         prompt, deps=deps, message_history=build_message_history(context),
     )
@@ -667,7 +667,7 @@ async def stream_invoke(
     order before the closing text + suggestions so the map appears
     above the narrative.
     """
-    deps = AgentDeps(task_id=context.task_id or "")
+    deps = AgentDeps()
     result = await holiday_agent.run(
         prompt, deps=deps, message_history=build_message_history(context),
     )

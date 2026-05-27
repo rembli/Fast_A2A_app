@@ -204,14 +204,14 @@ class AgentDeps:
     refer to them by URL).
     *generated* collects the artifacts produced during the run; the
     outer ``invoke`` / ``stream_invoke`` yields them after agent.run().
-    *task_id* is the A2A task identifier, retained for tools that need
-    to reference the active task; live status is emitted via
-    ``report_progress(message)`` (request-scoped via ContextVar).
+
+    Live status from inside tools goes through ``report_progress(msg)``,
+    which is request-scoped via a ContextVar set by ``build_stream_invoke``
+    — no task identity needs to be threaded through deps.
     """
     config: dict[str, str]
     available_images: list[tuple[str, str]]   # [(url, label), ...]
     generated: list[Artifact] = field(default_factory=list)
-    task_id: str = ""
 
 
 SYSTEM_PROMPT = f"""You are an expert visual director helping the user create
@@ -815,7 +815,6 @@ def _prepare_run(
     deps = AgentDeps(
         config=config,
         available_images=available_images,
-        task_id=context.task_id or "",
     )
 
     # The active /set parameters are appended to the user prompt so the

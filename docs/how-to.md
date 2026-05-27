@@ -96,7 +96,7 @@ MAX_TOOL_CALLS      = int(os.environ.get("MAX_TOOL_CALLS", "15"))
 MAX_TOKENS_PER_TURN = int(os.environ.get("MAX_TOKENS_PER_TURN", "60000"))
 ```
 
-The override surface is now one file — operators set env vars (or drop entries into `examples/.env`, which `main.py` loads via `python-dotenv` *before* the first `import config`), and a code-reader can find every tunable by reading `config.py` top-to-bottom. The three richer examples ([data-analysis-agent](../examples/data-analysis-agent), [image-creator](../examples/image-creator), [holiday-planner](../examples/holiday-planner)) use this shape; the minimal echo / joke agents stay two-file because three names per module don't earn the indirection.
+The override surface is now one file — operators set env vars (or drop entries into `examples/.env`, which `main.py` loads via `python-dotenv` *before* the first `import config`), and a code-reader can find every tunable by reading `config.py` top-to-bottom. The two richer examples ([image-creator](../examples/image-creator), [holiday-planner](../examples/holiday-planner)) use this shape; the minimal echo / joke agents stay two-file because three names per module don't earn the indirection.
 
 The single-file inline shape is fine when there's no second file to share state with — see the [60-second quickstart in the README](../README.md#60-second-quickstart). But the moment you add tools, prompt templates, message-history shaping, or a second auxiliary module (sandbox session, cache, image store…), splitting `agent.py` from `main.py` (and lifting env reads into `config.py`) pays off: each file owns one concern, and operators can audit every setting at a glance.
 
@@ -517,7 +517,7 @@ The UI then `POST`s files to `/uploads` as `multipart/form-data`, receives `{id,
 By default the picker allows the four image formats the chat UI renders inline (`image/png`, `image/jpeg`, `image/webp`, `image/gif`). Override that with `accepted_file_types` — same format as the HTML `<input accept>` attribute (file extensions, MIME types, or MIME wildcards):
 
 ```python
-# Single-file CSV / Excel uploader (see examples/data-analysis-agent)
+# Single-file CSV / Excel uploader
 app.mount("/", build_a2a_ui(
     file_upload_api="/uploads",
     accepted_file_types=[
@@ -637,7 +637,7 @@ async def stream_invoke(prompt: str):
 
 Common patterns:
 
-- **Closing pills** at the end of every turn — see `examples/data-analysis-agent`, which generates them dynamically from the user's question + the agent reply + the loaded dataset names rather than using a fixed list.
+- **Closing pills** at the end of every turn — see `examples/holiday-planner`, which generates them dynamically from the conversation context rather than using a fixed list.
 - **Slash-command shortcuts** — wire labels to `"/help"`, `"/clear"`, etc., so a new user can discover commands without typing them.
 - **Multi-step routing** — instead of asking the user a free-form clarification, offer 2–3 enumerated branches the agent can switch on next turn.
 
@@ -807,6 +807,17 @@ Cross-instance cancel signals flow through the same Protocol, so a custom backen
 
 For agents where a mid-run crash should NOT lose progress — long tool chains, expensive sandbox executions, multi-step workflows — wrap the underlying pydantic-ai `Agent` with [`DBOSAgent`](https://ai.pydantic.dev/durable-execution/dbos/). Every model request and every tool call becomes a checkpointed step in Postgres; on process restart, in-flight workflows resume from the last completed step automatically.
 
+The framework gives you four primitives to plug DBOS into the A2A lifecycle. Skim them once so the recipes below make sense:
+
+| Primitive | What it does | Where it runs |
+|---|---|---|
+| `DBOSAgent(agent)` | Wraps a pydantic-ai `Agent`; checkpoints every step. | Inside `stream_invoke` / `invoke`. |
+| `SetWorkflowID(task_id)` | Pins the DBOS workflow ID to the A2A `task_id` so the two share identity. | `with`-block around `.run()`. |
+| [`on_task_cancel`](#lifecycle-hooks) | A2A user-pressed-Stop hook. Cancel the DBOS workflow so it isn't recovered later. | Triggered by the SDK. |
+| [`on_task_recover`](#crash-recovery) + [`clean_up_stale_tasks`](#crash-recovery) | Crash-recovery hook + startup sweeper that route stuck `TASK_STATE_WORKING` tasks through your callback. | App lifespan startup + lazy on `GetTask` / `SubscribeToTask`. |
+
+### Quickstart
+
 ```python
 from dbos import DBOS, DBOSConfig
 from pydantic_ai import Agent
@@ -825,9 +836,11 @@ my_agent = Agent(model=..., name="my_agent", end_strategy="exhaustive")
 my_agent_durable = DBOSAgent(my_agent)
 
 # 3) Use the durable wrapper in `stream_invoke` / `invoke` — same
-# `.run()` API as a plain Agent.
+# `.run()` API as a plain Agent. Pin the workflow ID to the A2A
+# task ID so cancellation and recovery can target it by name.
 async def stream_invoke(prompt, context):
-    result = await my_agent_durable.run(prompt, deps=deps)
+    with SetWorkflowID(context.task_id):
+        result = await my_agent_durable.run(prompt, deps=deps)
     yield text_artifact(str(result.output))
 ```
 
@@ -863,11 +876,11 @@ app.mount("/a2a", build_a2a_app(
 ))
 ```
 
-See [`examples/data-analysis-agent/`](../examples/data-analysis-agent/) for the full integration — pydantic-ai + Anthropic Opus 4.7 on Azure AI Foundry + DBOSAgent + PostgresTaskStore + Postgres-backed result cache, all wired together.
+A shared Postgres also keeps the failure model simple: if Postgres is up, both the durable workflow state *and* the A2A task transcript are intact; if Postgres is down, neither is — no split-brain between the two.
 
 ### Cancelling a running DBOS workflow
 
-When a user presses Stop, the A2A framework cancels the `asyncio.Task` and fires the `on_task_cancel` hook. To also cancel the underlying DBOS workflow (so it isn't recovered on next restart), pin the workflow ID to the A2A task ID with `SetWorkflowID` and cancel it by that ID in the hook:
+When a user presses Stop, the A2A framework cancels the in-process `asyncio.Task` and fires `on_task_cancel`. The cancellation only kills the *current* worker's coroutine — without a hook, the DBOS workflow stays `PENDING` in the system database and will be picked up again on the next `DBOS.launch()`. Cancel it explicitly:
 
 ```python
 from dbos import DBOS, SetWorkflowID
@@ -877,7 +890,7 @@ async def cancel_agent_workflow(context_id: str, task_id: str) -> None:
         await DBOS.cancel_workflow_async(task_id)
 
 async def stream_invoke(prompt, context):
-    with SetWorkflowID(context.task_id):
+    with SetWorkflowID(context.task_id):                       # ⬅ same ID the hook will use
         result = await my_agent_durable.run(prompt, deps=deps)
     yield text_artifact(str(result.output))
 
@@ -887,7 +900,84 @@ build_a2a_app(
 )
 ```
 
-This ensures the DBOS workflow is marked as `CANCELLED` in the system database and won't be retried.
+The `SetWorkflowID(context.task_id)` line is what makes this work — without it, the DBOS-assigned UUID is unrelated to the A2A `task_id` and the hook has nothing to target.
+
+### Crash recovery
+
+DBOS resumes workflows from the last completed step on restart, but the surrounding A2A task is a separate concern: it can still be `TASK_STATE_WORKING` from the dead worker's perspective, with a UI tab somewhere waiting on a terminal event that's never coming. The framework detects this two ways:
+
+* **Lazy** — on every `GetTask` / `SubscribeToTask`, the request handler checks the per-task heartbeat (refreshed by `report_progress` and the executor itself). A task `WORKING` for more than 30 seconds with no live writer is treated as crashed.
+* **Eager** — call [`clean_up_stale_tasks(task_store, on_task_recover=...)`](api.md#clean_up_stale_tasks) from the lifespan after `DBOS.launch()` so stuck tasks are reconciled at boot, without waiting for a client to poll.
+
+Both paths flow into `on_task_recover(task_id, task_store)`. The hook is advisory: do whatever agent-side cleanup you need; the framework then default-finalizes the task as `TASK_STATE_FAILED` with a generic "please retry" message. `finalize_task` is idempotent at the store layer, so if your hook already wrote a terminal state it stays intact.
+
+You pick the recovery policy by what the hook does. Two patterns cover almost all cases.
+
+**Policy A — give up the in-flight task.** Cancel the workflow so DBOS doesn't keep replaying it, and let the framework's default `FAILED` finalize unstick the UI:
+
+```python
+from dbos import DBOS
+from fast_a2a_app import clean_up_stale_tasks
+
+async def recover_agent_workflow(task_id: str, task_store) -> None:
+    # The workflow ID was pinned to task_id via SetWorkflowID — cancel it
+    # so a fresh DBOS.launch() doesn't resume an orphan workflow whose
+    # client is long gone.
+    await DBOS.cancel_workflow_async(task_id)
+    # Optional: emit telemetry, write a tailored status_message via
+    # task_store.finalize_task(... TASK_STATE_FAILED, status_message=...).
+    # If you don't, the framework writes "Agent worker stopped unexpectedly.
+    # Please retry." for you.
+
+@asynccontextmanager
+async def lifespan(app):
+    DBOS.launch()
+    store = await PostgresTaskStore.from_dsn(POSTGRES_URL)
+    await clean_up_stale_tasks(store, on_task_recover=recover_agent_workflow)
+    try:
+        yield
+    finally:
+        await store.close()
+        DBOS.destroy(workflow_completion_timeout_sec=30)
+
+build_a2a_app(
+    ...,
+    task_store=store,
+    on_task_recover=recover_agent_workflow,    # also fires lazily on GetTask/Subscribe
+)
+```
+
+This is the right default for most apps — DBOS still gives you "no duplicate work" (cached steps are reused if the user re-asks the same question via a `result_cache`), but the original A2A task ends cleanly instead of a recovered DBOS workflow racing the user's retry.
+
+**Policy B — actively resume the task on a fresh worker.** Some workflows are too expensive to discard and re-ask. In that case the hook re-drives the agent end-to-end and writes its own terminal state. This needs [`bind_executor`](api.md#bind_executor) so `report_progress(...)` from inside the resumed run lands on the right task in the store and reaches any still-subscribed UI:
+
+```python
+from a2a.types import TaskState
+from fast_a2a_app import bind_executor, report_progress
+
+async def recover_agent_workflow(task_id: str, task_store) -> None:
+    task = await task_store.get(task_id)
+    if task is None:
+        return
+    prompt, context = await reconstruct_prompt_and_context(task)   # your call
+
+    async with bind_executor(task_id, task_store):
+        report_progress("Resuming after restart…")
+        artifacts = []
+        # DBOSAgent.run inside stream_invoke will replay cached steps and
+        # only re-execute the ones that hadn't checkpointed.
+        async for chunk in stream_invoke(prompt, context):
+            if not isinstance(chunk, str):
+                artifacts.append(chunk)
+
+    await task_store.finalize_task(
+        task_id,
+        state=TaskState.TASK_STATE_COMPLETED,
+        artifacts=artifacts,
+    )
+```
+
+`bind_executor` sets the request-scoped `ContextVar`s that `report_progress` reads, mirroring what the executor does inside a normal request. Without it, a recovered run still completes (DBOS doesn't care about progress strings) but the UI sees nothing between "Resuming…" and the terminal event.
 
 ### Watching workflows live with dbos-argus
 
@@ -898,17 +988,23 @@ uvx dbos-argus@latest --db-url "$POSTGRES_URL"
 # open http://localhost:8090
 ```
 
-It shows parent/child workflow trees, step status (`PENDING` / `SUCCESS` / `ERROR` / `CANCELLED`), retries, and completed/failed runs. No app integration is needed — Argus reads `dbos.workflow_status` directly.
+It shows parent/child workflow trees, step status (`PENDING` / `SUCCESS` / `ERROR` / `CANCELLED`), retries, and completed/failed runs. No app integration is needed — Argus reads `dbos.workflow_status` directly. Pin the workflow ID to the A2A `task_id` (as the snippets above do) and you can paste a `task_id` straight from the chat UI into Argus's search.
 
 ### What is and isn't durable
 
-| Replayed on recovery | Not replayed on recovery |
+| Replayed on recovery | NOT replayed on recovery |
 |---|---|
-| Model requests (cached completions) | Tool side effects on `ctx.deps` |
+| Model requests (cached completions) | Tool side effects on `ctx.deps` (in-memory dataclass) |
 | Tool return values | Files written to local disk during tool execution |
-| The agent's final `result.output` | Streaming `report_progress(...)` events |
+| The agent's final `result.output` | Streaming `report_progress(...)` events emitted before the crash |
 
-Tools that mutate `ctx.deps` (e.g. appending to a `deps.generated` artifact list) WILL re-run their cached return values on recovery, but those mutations are lost — DBOS replays step *outputs*, not arbitrary in-memory state. Mitigation patterns: (a) have tools *return* the data they want surfaced and collect it at the call site, (b) layer a `result_cache` so a repeat user query reproduces the artifacts cheaply, or (c) accept the degradation — the recovered workflow still produces the same final text reply, just without the inline tables / charts from already-completed tools.
+Tools that mutate `ctx.deps` (e.g. appending to a `deps.generated` artifact list) WILL re-run their cached return values on recovery, but those mutations are lost — DBOS replays step *outputs*, not arbitrary in-memory state. Mitigation patterns:
+
+1. **Return the data, don't mutate.** Have tools *return* the artifacts they want surfaced and collect them at the call site. The return value is what DBOS checkpoints.
+2. **Layer a `result_cache`.** Key by a stable hash of the inputs (prompt + uploaded-file digests + parameters) so a repeat user query reproduces the artifacts cheaply, even from a brand-new process.
+3. **Accept the degradation.** The recovered workflow still produces the same final text reply — just without the inline tables / charts the already-completed tools would have appended to `deps.generated`.
+
+`report_progress` strings are deliberately *not* durable: they're UX, not state. If a worker crashes mid-run, the persisted log up to the crash is still replayed to any client that reconnects (that's the task store's job), but a *recovered* DBOS workflow doesn't re-emit them — use Policy B above with an explicit `report_progress("Resuming…")` if you want a UI heartbeat during the resume.
 
 ---
 

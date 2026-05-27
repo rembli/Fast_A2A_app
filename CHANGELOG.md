@@ -40,6 +40,13 @@
   `main.py` boilerplate, `build_a2a_app` knobs, and the multi-turn/HITL
   section compressed to essentials. pydantic-ai called out as the
   recommended framework.
+- **`report_progress(message)` — `task_id` no longer threaded through deps.**
+  The executor binds the active task identity to a request-scoped
+  ContextVar on every `execute()`, so `report_progress` resolves the
+  current task by itself. The previous `report_progress(task_id, message)`
+  call sites are gone, and the `task_id` field on the example `AgentDeps`
+  dataclasses was removed along with them. Update any out-of-tree agent
+  that still passes a `task_id`: drop the first positional argument.
 
 ## 0.6.0 — 2026-05-11
 

@@ -733,7 +733,7 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
         agent_executor: ConfigurableAgentExecutor,
         task_store: A2ATaskStore,
         progress_store: A2ATaskStore,
-        on_task_recover: Callable[[str], Awaitable[None]] | None = None,
+        on_task_recover: Callable[[str, A2ATaskStore], Awaitable[None]] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -781,7 +781,7 @@ class ProgressAwareRequestHandler(DefaultRequestHandler):
         """
         if self._on_task_recover is not None:
             try:
-                await self._on_task_recover(task.id)
+                await self._on_task_recover(task.id, self._progress_store)
             except Exception:
                 log.exception(
                     "on_task_recover hook failed for task=%s — falling through to default finalize",
@@ -1134,7 +1134,7 @@ async def bind_executor(task_id: str, task_store: A2ATaskStore):
     framework's subsequent default-finalize-as-FAILED is a no-op once
     the hook has settled the task::
 
-        async def recover_my_workflow(task_id: str, task_store):
+        async def recover_my_workflow(task_id: str, task_store: A2ATaskStore):
             task = await task_store.get(task_id)
             ...
             async with bind_executor(task_id, task_store):
@@ -1162,7 +1162,7 @@ async def bind_executor(task_id: str, task_store: A2ATaskStore):
 async def clean_up_stale_tasks(
     task_store: A2ATaskStore,
     *,
-    on_task_recover: Callable[[str], Awaitable[None]] | None = None,
+    on_task_recover: Callable[[str, A2ATaskStore], Awaitable[None]] | None = None,
     threshold_secs: float = _STALE_THRESHOLD,
 ) -> list[str]:
     """Finalize tasks left WORKING by a previous process.
@@ -1177,11 +1177,11 @@ async def clean_up_stale_tasks(
             await clean_up_stale_tasks(store, on_task_recover=my_recover_hook)
             ...
 
-    For each stale task ``on_task_recover(task_id)`` is invoked first
-    (best-effort, advisory) so the agent can do its own cleanup —
-    cancel a stuck durable workflow, emit telemetry, write a tailored
-    status message via ``finalize_task``. The framework then calls
-    ``task_store.finalize_task(... TASK_STATE_FAILED)``, which is
+    For each stale task ``on_task_recover(task_id, task_store)`` is
+    invoked first (best-effort, advisory) so the agent can do its own
+    cleanup — cancel a stuck durable workflow, emit telemetry, write a
+    tailored status message via ``finalize_task``. The framework then
+    calls ``task_store.finalize_task(... TASK_STATE_FAILED)``, which is
     idempotent at the store layer: a hook that already wrote a
     terminal state leaves it intact.
 
@@ -1203,7 +1203,7 @@ async def clean_up_stale_tasks(
     for task_id in stale:
         if on_task_recover is not None:
             try:
-                await on_task_recover(task_id)
+                await on_task_recover(task_id, task_store)
             except Exception:
                 log.exception(
                     "clean_up_stale_tasks: on_task_recover failed task=%s — falling through to default finalize",
@@ -1235,7 +1235,7 @@ def build_a2a_app(
     prompt_builder: Callable[[RequestContext], str] | None = None,
     on_task_start: Callable[[str], Awaitable[None]] | None = None,
     on_task_cancel: Callable[[str, str], Awaitable[None]] | None = None,
-    on_task_recover: Callable[[str], Awaitable[None]] | None = None,
+    on_task_recover: Callable[[str, A2ATaskStore], Awaitable[None]] | None = None,
     task_store: A2ATaskStore | None = None,
     debug: bool = False,
 ):
@@ -1310,15 +1310,20 @@ def build_a2a_app(
     in-process :class:`MemoryTaskStore` is used — zero infrastructure,
     suitable for development and single-process deployments only.
 
-    ``on_task_recover(task_id)`` is an async, advisory hook called
-    whenever the framework detects a stuck WORKING task whose worker
-    has died (lazy on ``GetTask`` / ``SubscribeToTask``, eager from
-    :func:`clean_up_stale_tasks` at startup). Use it for agent-side
-    cleanup — cancelling a stuck durable workflow, emitting telemetry,
-    optionally writing a tailored status message via
-    ``finalize_task``. After the hook returns the framework
-    default-finalizes the task as ``TASK_STATE_FAILED`` (no-op if the
-    hook already wrote a terminal state), so the UI always unsticks.
+    ``on_task_recover(task_id, task_store)`` is an async, advisory
+    hook called whenever the framework detects a stuck WORKING task
+    whose worker has died (lazy on ``GetTask`` / ``SubscribeToTask``,
+    eager from :func:`clean_up_stale_tasks` at startup). The same
+    :class:`A2ATaskStore` instance you passed in (or the default
+    :class:`MemoryTaskStore`) is forwarded as the second argument so
+    the hook can call ``task_store.get(...)`` / ``finalize_task(...)``
+    without the caller having to thread the store in via a closure or
+    ``functools.partial``. Use it for agent-side cleanup — cancelling
+    a stuck durable workflow, emitting telemetry, optionally writing
+    a tailored status message via ``finalize_task``. After the hook
+    returns the framework default-finalizes the task as
+    ``TASK_STATE_FAILED`` (no-op if the hook already wrote a terminal
+    state), so the UI always unsticks.
 
     Set ``debug=True`` to include exception details in agent failure messages.
     """
