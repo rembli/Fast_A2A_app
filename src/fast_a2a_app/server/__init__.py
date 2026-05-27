@@ -28,7 +28,7 @@ from .task_stores import (
     PostgresTaskStore,
     RedisTaskStore,
 )
-from .utils import register_progress_resolver, report_progress
+from .utils import report_progress
 
 __all__ = [
     # App factory
@@ -60,6 +60,5 @@ __all__ = [
     "MongoTaskStore",
     "PostgresTaskStore",
     "RedisTaskStore",
-    "register_progress_resolver",
     "report_progress",
 ]

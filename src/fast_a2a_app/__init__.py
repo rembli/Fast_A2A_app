@@ -48,7 +48,13 @@ Typical usage::
 See ``build_a2a_app`` for detailed examples of each level.
 
 Call ``report_progress("step 2/5…")`` from anywhere inside your agent
-(including tools) to push live status updates to the chat UI.
+(tools, helpers, child tasks spawned with ``asyncio.create_task``) to push
+live status updates to the chat UI. No task_id argument is required — the
+framework resolves the active task from a request-scoped ContextVar set by
+``ConfigurableAgentExecutor`` on each request. Each call appends to the
+configured task store; the executor's per-task subscriber re-emits entries
+as SSE working-status events, so live delivery and resubscribe replay
+share one source of truth.
 """
 from . import _sdk_compat as _sdk_compat
 _sdk_compat.apply()
@@ -77,7 +83,6 @@ from .server import (
     image_artifact,
     map_artifact,
     prompt_suggestions_artifact,
-    register_progress_resolver,
     report_progress,
     table_artifact,
     text_artifact,
@@ -113,7 +118,6 @@ __all__ = [
     "MongoTaskStore",
     "PostgresTaskStore",
     "RedisTaskStore",
-    "register_progress_resolver",
     "report_progress",
     # UI
     "a2a_ui",

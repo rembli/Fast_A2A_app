@@ -1,162 +1,75 @@
 """
 utils.py — Shared A2A utilities
 
-Provides report_progress(), a thin helper that agent tools call to push
-live status strings to the client during a streaming response.
+Provides ``report_progress(message)``: a fire-and-forget helper that agent
+tools call to push a live status string to the client during a streaming
+response.
 
-The callback is propagated via a ContextVar so it flows automatically
-across async boundaries without any explicit threading or parameter
-passing. build_stream_invoke (in route.py) sets the callback before
-each run; calls outside a streaming context are silently ignored.
+State flow is request-scoped via two ContextVars set by the executor on
+entry to ``execute()`` and reset on exit:
 
-A second ContextVar — set by the executor — carries crash-recovery
-metadata (task_id + task_store) so each ``report_progress(...)`` call
-is also persisted to the configured ``A2ATaskStore``. The persisted
-log lets the UI's resubscribe path replay messages after a transport
-hiccup or a worker crash without changing the public API.
+* ``_current_executor`` — the active :class:`ConfigurableAgentExecutor`
+* ``_current_task_id``  — the task_id this request is executing
+
+Two ContextVars (instead of one) keep the per-request state out of the
+executor instance, which is shared across concurrent requests. Each
+concurrent ``execute()`` runs in its own contextvars context, so the
+task_id and executor binding never collide.
+
+Inside the request, the executor's task is the parent of every agent step,
+every pydantic-ai tool call, and any ``asyncio.create_task`` the user
+spawns — all inherit a copy of the ContextVar values. So every
+``report_progress`` call from inside the request resolves to the right
+``(task_id, task_store)`` pair with no plumbing.
+
+Outside an active request (module import, tests with no executor, a DBOS
+workflow recovered on a fresh process where the original executor is gone)
+the ContextVars are unset and ``report_progress`` is a silent no-op.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .task_stores import A2ATaskStore
+    from .route import ConfigurableAgentExecutor
 
 log = logging.getLogger(__name__)
 
-_progress_cb: contextvars.ContextVar[
-    Callable[[str], None] | None
-] = contextvars.ContextVar("_progress_cb", default=None)
 
+_current_executor: ContextVar["ConfigurableAgentExecutor | None"] = ContextVar(
+    "fast_a2a_app.current_executor", default=None,
+)
 
-@dataclass
-class _ProgressMeta:
-    """Crash-recovery metadata for ``report_progress(...)``.
-
-    Set by ``ConfigurableAgentExecutor`` for the duration of one task; lets
-    ``report_progress`` fire-and-forget a write to the configured task store
-    in addition to pushing onto the live in-process SSE queue.
-    """
-
-    task_id: str
-    task_store: "A2ATaskStore"
-
-
-_progress_meta: contextvars.ContextVar[
-    _ProgressMeta | None
-] = contextvars.ContextVar("_progress_meta", default=None)
-
-
-# Process-global fallback resolver. Used when ``_progress_meta`` is not
-# set in the current ContextVar — typically because the work is running
-# inside a durable-execution workflow (e.g., DBOS) that was recovered on
-# a different process after a crash, so the executor's ContextVar token
-# never got handed down. The resolver returns ``(task_id, task_store)``
-# at call time, letting the example wire it to whatever runtime symbol
-# carries the current task id (e.g., ``DBOS.workflow_id``).
-_progress_resolver: Callable[
-    [], "_ProgressMeta | None"
-] | None = None
-
-
-def register_progress_resolver(
-    resolver: Callable[[], tuple[str, "A2ATaskStore"] | None] | None,
-) -> None:
-    """Register a process-global fallback for ``report_progress`` persistence.
-
-    The executor sets a ``_progress_meta`` ContextVar before calling the
-    agent so ``report_progress`` writes flow into the active task store.
-    ContextVars don't survive a process crash, however — when a durable
-    workflow (DBOS, Temporal, …) is recovered on a fresh process, the
-    ContextVar isn't set on its event loop, and ``report_progress``
-    becomes a no-op.
-
-    A resolver registered here is consulted when the ContextVar is
-    missing. It should return ``(task_id, task_store)`` for the work
-    currently running on this thread/loop, or ``None`` if no task is
-    active (the call is then silently ignored).
-
-    Example wiring for a DBOS-recovered workflow::
-
-        from fast_a2a_app import register_progress_resolver
-        from dbos import DBOS
-
-        def _resolver():
-            wf_id = DBOS.workflow_id  # set by SetWorkflowID(task_id)
-            return (wf_id, task_store) if wf_id else None
-
-        register_progress_resolver(_resolver)
-
-    Pass ``None`` to clear an existing resolver (e.g., during teardown
-    in tests).
-    """
-    global _progress_resolver
-    if resolver is None:
-        _progress_resolver = None
-        return
-
-    def _wrapped() -> _ProgressMeta | None:
-        try:
-            result = resolver()
-        except Exception:
-            log.debug("Progress resolver raised", exc_info=True)
-            return None
-        if result is None:
-            return None
-        task_id, task_store = result
-        return _ProgressMeta(task_id=task_id, task_store=task_store)
-
-    _progress_resolver = _wrapped
+_current_task_id: ContextVar[str | None] = ContextVar(
+    "fast_a2a_app.current_task_id", default=None,
+)
 
 
 def report_progress(message: str) -> None:
-    """Push a status string to the A2A streaming layer.
+    """Append a status string to the current request's progress log.
 
-    Call from any agent tool to update the client's progress indicator.
-    Has no effect outside a streaming context (non-streaming calls, tests).
+    Resolves the active ``ConfigurableAgentExecutor`` from a request-scoped
+    ContextVar set inside the executor's ``execute()`` body, and delegates
+    to ``executor.report_progress(message)``. Fire-and-forget: the store
+    write is scheduled as a background task on the current event loop, so
+    the caller doesn't pay round-trip latency.
 
-    The message is also persisted to the configured ``A2ATaskStore`` when
-    one is available, so it survives a worker crash and gets replayed on
-    the next ``SubscribeToTask``. After a DBOS-style recovery the
-    ContextVar isn't set; if a resolver has been registered via
-    ``register_progress_resolver`` it provides the (task_id, task_store)
-    pair so persistence still happens.
+    Safe to call from sync or async tools, from helpers, and from
+    ``asyncio.create_task`` siblings of the agent run (the ContextVar is
+    copied at task creation). Silently no-ops if no executor is bound —
+    e.g. at module-import time, in tests with no live request, or inside
+    a DBOS workflow recovered on a fresh process.
+
+    Live SSE delivery happens via the executor's progress subscriber;
+    resubscribe replay reads the persisted log via ``store.read_progress``.
+    The function returns immediately whether or not delivery succeeds —
+    failures are logged but never raised, since a progress hiccup must not
+    break the agent run.
     """
-    cb = _progress_cb.get()
-    if cb is not None:
-        cb(message)
-
-    meta = _progress_meta.get()
-    if meta is None and _progress_resolver is not None:
-        meta = _progress_resolver()
-    if meta is not None:
-        _persist_progress(meta, message)
-
-
-def _persist_progress(meta: _ProgressMeta, message: str) -> None:
-    """Fire-and-forget the store write so ``report_progress`` stays sync + fast.
-
-    A failure here must never break the live stream — agent tools have no way
-    to handle it, and the live SSE event has already been enqueued.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
+    executor = _current_executor.get()
+    if executor is None:
         return
-
-    async def _write() -> None:
-        try:
-            await meta.task_store.append_progress(meta.task_id, message)
-        except Exception:
-            log.warning(
-                "Failed to persist progress for task_id=%s", meta.task_id,
-                exc_info=True,
-            )
-
-    loop.create_task(_write())
+    executor.report_progress(message)

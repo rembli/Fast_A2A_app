@@ -18,7 +18,6 @@ build_invoke                — Wraps any async (str) -> str function as a
 
 build_stream_invoke         — Wraps any async (str) -> AsyncIterable[str]
                               generator as a streaming A2A invoke callable.
-                              Also sets up the report_progress() ContextVar.
 
 ConfigurableAgentExecutor   — AgentExecutor that calls invoke or
                               stream_invoke, handles errors, and routes
@@ -32,10 +31,14 @@ ContextAwareRequestContextBuilder
 
 HOW STREAMING WORKS
 -------------------
-build_stream_invoke wraps your generator in an asyncio.Queue relay and sets
-the _progress_cb ContextVar before starting the generator task. Any code
-called during streaming can therefore call report_progress() to push a
-non-final working-status SSE event to the chat UI.
+build_stream_invoke is a thin signature normaliser around the user's
+generator; chunks land on the SSE event queue as text/artifact updates.
+Progress messages flow on a separate path: tools call
+report_progress(msg), the framework resolves the active executor and
+task_id from request-scoped ContextVars, appends to the configured
+A2ATaskStore, and a per-task subscriber inside ConfigurableAgentExecutor
+re-emits each entry as a TASK_STATE_WORKING SSE event. The store is the
+single source of truth — same path delivers progress to resubscribers.
 
 HOW CROSS-INSTANCE CANCELLATION WORKS
 --------------------------------------
@@ -86,7 +89,7 @@ from a2a.types import (
 from starlette.routing import Router
 
 from .task_stores import A2ATaskStore, MemoryTaskStore
-from .utils import _ProgressMeta, _progress_cb, _progress_meta
+from .utils import _current_executor, _current_task_id
 
 log = logging.getLogger(__name__)
 
@@ -106,10 +109,6 @@ _STALE_THRESHOLD = 30
 # pub/sub) — this poll is only needed because terminal state lives on
 # the Task, not in the progress log.
 _REMOTE_STATE_POLL_INTERVAL = 2.0
-
-# Sentinel distinguishing in-band progress strings from the final response text.
-# Null bytes make accidental collisions with real LLM output virtually impossible.
-_PROGRESS_PREFIX = "\x00p\x00"
 
 
 
@@ -318,6 +317,37 @@ class ConfigurableAgentExecutor(AgentExecutor):
         running = self._running_tasks.get(task_id)
         return running is not None and not running.done()
 
+    def report_progress(self, message: str) -> None:
+        """Append a status string to the current task's progress log.
+
+        Fire-and-forget: schedules a background write on the running event
+        loop and returns immediately so callers don't pay round-trip latency.
+        Silently no-ops when there is no task store, no task id in scope, or
+        no running loop (e.g. called from a sync context after execute()
+        exited).
+
+        The task_id is resolved from the ``_current_task_id`` ContextVar
+        rather than from instance state — the executor object is shared
+        across concurrent requests, but each ``execute()`` runs in its own
+        contextvars context so the task_id never collides.
+        """
+        task_id = _current_task_id.get()
+        if not self._task_store or not task_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._safe_append_progress(task_id, message))
+
+    async def _safe_append_progress(self, task_id: str, message: str) -> None:
+        try:
+            await self._task_store.append_progress(task_id, message)
+        except Exception:
+            log.warning(
+                "Progress append failed (task=%s)", task_id, exc_info=True,
+            )
+
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Run the agent for one A2A task, emitting task/status/artifact events."""
         message = context.message
@@ -332,6 +362,8 @@ class ConfigurableAgentExecutor(AgentExecutor):
             await self._on_task_start(context_id)
 
         self._task_contexts[task_id] = context_id
+        executor_token = _current_executor.set(self)
+        task_id_token = _current_task_id.set(task_id)
 
         await event_queue.enqueue_event(task)
         await event_queue.enqueue_event(
@@ -348,16 +380,6 @@ class ConfigurableAgentExecutor(AgentExecutor):
                 ),
             )
         )
-
-        # Bind the task to ``_progress_meta`` so each ``report_progress(...)``
-        # call inside the agent also writes to the task store. The
-        # ContextVar token is reset in the ``finally`` block at the bottom
-        # of ``execute()`` so the binding never leaks across requests.
-        progress_meta_token = None
-        if self._task_store and task_id:
-            progress_meta_token = _progress_meta.set(
-                _ProgressMeta(task_id=task_id, task_store=self._task_store)
-            )
 
         async def _do_work() -> None:
             try:
@@ -430,6 +452,7 @@ class ConfigurableAgentExecutor(AgentExecutor):
 
         poll_task: asyncio.Task | None = None
         heartbeat_task: asyncio.Task | None = None
+        progress_task: asyncio.Task | None = None
         if self._task_store and task_id:
             store = self._task_store
 
@@ -457,8 +480,40 @@ class ConfigurableAgentExecutor(AgentExecutor):
                     except Exception:
                         log.debug("Heartbeat write error (task=%s)", task_id)
 
+            async def _stream_progress() -> None:
+                # Tail the persisted progress log and re-emit each entry as a
+                # WORKING-status SSE event. ``report_progress`` writes flow
+                # through the task store; this is the single path that turns
+                # them into client-visible updates — same mechanism as the
+                # remote-resubscribe tail, so local + cross-replica behave
+                # identically.
+                try:
+                    async for entry in store.subscribe_progress(task_id):
+                        await event_queue.enqueue_event(
+                            TaskStatusUpdateEvent(
+                                task_id=task_id,
+                                context_id=context_id,
+                                status=TaskStatus(
+                                    state=TaskState.TASK_STATE_WORKING,
+                                    message=new_text_message(
+                                        entry.message,
+                                        context_id=context_id,
+                                        task_id=task_id,
+                                    ),
+                                ),
+                            )
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.warning(
+                        "Progress subscriber failed (task=%s)", task_id,
+                        exc_info=True,
+                    )
+
             poll_task = asyncio.create_task(_poll_cancel_signal())
             heartbeat_task = asyncio.create_task(_heartbeat())
+            progress_task = asyncio.create_task(_stream_progress())
 
         try:
             await asyncio_task
@@ -476,8 +531,8 @@ class ConfigurableAgentExecutor(AgentExecutor):
                 poll_task.cancel()
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
-            if progress_meta_token is not None:
-                _progress_meta.reset(progress_meta_token)
+            if progress_task is not None:
+                progress_task.cancel()
             if self._task_store and task_id:
                 # Drop the persisted progress log now that the task has
                 # reached a terminal state — no further replay is useful and
@@ -486,6 +541,8 @@ class ConfigurableAgentExecutor(AgentExecutor):
                     await self._task_store.clear_progress(task_id)
             self._running_tasks.pop(task_id, None)
             self._task_contexts.pop(task_id, None)
+            _current_task_id.reset(task_id_token)
+            _current_executor.reset(executor_token)
 
     async def _stream_response(
         self,
@@ -542,24 +599,6 @@ class ConfigurableAgentExecutor(AgentExecutor):
                 continue
 
             if not chunk:
-                continue
-
-            if chunk.startswith(_PROGRESS_PREFIX):
-                progress_text = chunk[len(_PROGRESS_PREFIX):]
-                await event_queue.enqueue_event(
-                    TaskStatusUpdateEvent(
-                        task_id=task_id,
-                        context_id=context_id,
-                        status=TaskStatus(
-                            state=TaskState.TASK_STATE_WORKING,
-                            message=new_text_message(
-                                progress_text,
-                                context_id=context_id,
-                                task_id=task_id,
-                            ),
-                        ),
-                    )
-                )
                 continue
 
             if pending_chunk is None:
@@ -1002,50 +1041,18 @@ def build_stream_invoke(
 
         stream_invoke=build_stream_invoke(my_agent)
 
-    The wrapper sets up the ``report_progress()`` ContextVar so any code called
-    during streaming can push live status updates to the chat UI — regardless of
-    which AI framework (or none) your agent uses.
+    The wrapper only normalises the ``(prompt, context)`` signature. Live
+    progress updates flow independently: tools call
+    ``report_progress(msg)``, the framework appends to the task store, and
+    the executor's subscriber re-emits them as SSE status events.
     """
     pass_context = _accepts_context(run)
 
     async def _stream(prompt: str, context: RequestContext) -> AsyncIterable[str | Artifact]:
-        _DONE = object()
-        queue: asyncio.Queue = asyncio.Queue()
-        error_holder: list[BaseException | None] = [None]
-
-        def _on_progress(msg: str) -> None:
-            queue.put_nowait(_PROGRESS_PREFIX + msg)
-
-        token = _progress_cb.set(_on_progress)
-
-        async def _run() -> None:
-            try:
-                gen = run(prompt, context) if pass_context else run(prompt)
-                async for chunk in gen:
-                    if chunk:
-                        queue.put_nowait(chunk)
-            except asyncio.CancelledError as exc:
-                error_holder[0] = exc
-            except Exception as exc:
-                error_holder[0] = exc
-            finally:
-                queue.put_nowait(_DONE)
-
-        run_task = asyncio.create_task(_run())
-        try:
-            while True:
-                item = await queue.get()
-                if item is _DONE:
-                    break
-                yield item
-        finally:
-            _progress_cb.reset(token)
-            if not run_task.done():
-                run_task.cancel()
-
-        exc = error_holder[0]
-        if exc is not None:
-            raise exc
+        gen = run(prompt, context) if pass_context else run(prompt)
+        async for chunk in gen:
+            if chunk:
+                yield chunk
 
     return _stream
 

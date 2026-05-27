@@ -112,8 +112,12 @@ class AgentDeps:
     to surface alongside the LLM's narrative reply. ``main.py`` drains
     it after ``agent.run()`` returns and yields each artifact into the
     A2A stream.
+
+    ``task_id`` is the A2A task identity, required by ``report_progress``
+    so the framework can route progress messages to the right task log.
     """
 
+    task_id: str = ""
     generated: list[Artifact] = field(default_factory=list)
 
 
@@ -240,7 +244,9 @@ async def recommend_destinations(
         budget_level: 'budget', 'moderate', or 'luxury'
         travel_month: Month of travel (e.g. 'July', 'December')
     """
-    report_progress(f"Finding destinations for {duration_days}-day {budget_level} trip in {travel_month}…")
+    report_progress(
+        f"Finding destinations for {duration_days}-day {budget_level} trip in {travel_month}…",
+    )
 
     prompt = f"""Generate exactly 2-3 holiday destination recommendations as a JSON array.
 
@@ -341,8 +347,9 @@ Return ONLY the JSON array, no markdown."""
     return "\n".join(lines)
 
 
-@holiday_agent.tool_plain
+@holiday_agent.tool
 async def create_itinerary(
+    ctx: RunContext[AgentDeps],
     destination: str,
     duration_days: int,
     interests: str,
@@ -356,7 +363,9 @@ async def create_itinerary(
         interests: Comma-separated interests to prioritise
         pace: 'relaxed', 'moderate', or 'packed'
     """
-    report_progress(f"Building {duration_days}-day itinerary for {destination}…")
+    report_progress(
+        f"Building {duration_days}-day itinerary for {destination}…",
+    )
 
     prompt = f"""Create a {duration_days}-day holiday itinerary for {destination}.
 
@@ -383,8 +392,9 @@ Keep it exciting and practical."""
     return (response.choices[0].message.content or "").strip()
 
 
-@holiday_agent.tool_plain
+@holiday_agent.tool
 async def estimate_budget(
+    ctx: RunContext[AgentDeps],
     destination: str,
     duration_days: int,
     travellers: int,
@@ -398,7 +408,9 @@ async def estimate_budget(
         travellers: Number of people travelling
         budget_level: 'budget', 'moderate', or 'luxury'
     """
-    report_progress(f"Calculating budget for {travellers} traveller(s) in {destination}…")
+    report_progress(
+        f"Calculating budget for {travellers} traveller(s) in {destination}…",
+    )
 
     prompt = f"""Create a realistic budget estimate for:
 - Destination: {destination}
@@ -431,8 +443,9 @@ Use realistic local prices, not tourist-trap prices."""
     return (response.choices[0].message.content or "").strip()
 
 
-@holiday_agent.tool_plain
+@holiday_agent.tool
 async def get_travel_essentials(
+    ctx: RunContext[AgentDeps],
     destination: str,
     nationality: str,
     travel_month: str,
@@ -444,7 +457,9 @@ async def get_travel_essentials(
         nationality: Traveller's passport nationality (e.g. 'German', 'British')
         travel_month: Month of travel
     """
-    report_progress(f"Looking up travel essentials for {destination}…")
+    report_progress(
+        f"Looking up travel essentials for {destination}…",
+    )
 
     prompt = f"""Provide practical travel essentials for a {nationality} citizen visiting {destination} in {travel_month}.
 
@@ -626,7 +641,7 @@ async def invoke(prompt: str, context: RequestContext) -> Artifact:
     are silently dropped because A2A's one-shot contract returns a
     single Artifact.
     """
-    deps = AgentDeps()
+    deps = AgentDeps(task_id=context.task_id or "")
     result = await holiday_agent.run(
         prompt, deps=deps, message_history=build_message_history(context),
     )
@@ -652,7 +667,7 @@ async def stream_invoke(
     order before the closing text + suggestions so the map appears
     above the narrative.
     """
-    deps = AgentDeps()
+    deps = AgentDeps(task_id=context.task_id or "")
     result = await holiday_agent.run(
         prompt, deps=deps, message_history=build_message_history(context),
     )

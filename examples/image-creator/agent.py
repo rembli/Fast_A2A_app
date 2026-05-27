@@ -204,10 +204,14 @@ class AgentDeps:
     refer to them by URL).
     *generated* collects the artifacts produced during the run; the
     outer ``invoke`` / ``stream_invoke`` yields them after agent.run().
+    *task_id* is the A2A task identifier, retained for tools that need
+    to reference the active task; live status is emitted via
+    ``report_progress(message)`` (request-scoped via ContextVar).
     """
     config: dict[str, str]
     available_images: list[tuple[str, str]]   # [(url, label), ...]
     generated: list[Artifact] = field(default_factory=list)
+    task_id: str = ""
 
 
 SYSTEM_PROMPT = f"""You are an expert visual director helping the user create
@@ -352,8 +356,8 @@ async def generate_image(
 # to keyword substitution — delegate to an LLM that can interpret vibe
 # rather than templating the rewrite. Distinct from rewrite_prompt: this
 # *adds* visual detail, that one strips ambiguity from a verbose prompt.
-@image_agent.tool_plain
-async def expand_intent(vague_request: str) -> str:
+@image_agent.tool
+async def expand_intent(ctx: RunContext[AgentDeps], vague_request: str) -> str:
     """Turn a vague style note into a concrete visual prompt.
 
     Use when the user says things like "more retro", "cinematic feel",
@@ -387,8 +391,8 @@ async def expand_intent(vague_request: str) -> str:
 # Counterpart to expand_intent: that one *adds* style detail to a vague
 # brief; this one *removes* contradictions and looseness from an
 # already-verbose prompt before it hits the image model.
-@image_agent.tool_plain
-async def rewrite_prompt(rough_prompt: str) -> str:
+@image_agent.tool
+async def rewrite_prompt(ctx: RunContext[AgentDeps], rough_prompt: str) -> str:
     """Tighten a rough prompt before sending it to the image model.
 
     Use when the user's instruction is grammatically loose, contradictory,
@@ -422,8 +426,8 @@ async def rewrite_prompt(rough_prompt: str) -> str:
 # reach for external research and would over-rely on its own training.
 # The integration is per-team (Brave / SerpAPI / OpenAI Responses-API
 # web tool / etc.), so the body is intentionally a stub.
-@image_agent.tool_plain
-async def web_search(query: str) -> str:
+@image_agent.tool
+async def web_search(ctx: RunContext[AgentDeps], query: str) -> str:
     """Search the web for visual references and style cues.
 
     Use when the user references something specific you don't know about
@@ -456,8 +460,8 @@ async def web_search(query: str) -> str:
 # named internal assets ("the FY25 packshot"). Listing the tool keeps
 # that pathway visible to the chat model; the actual DAM integration
 # (S3 / Bynder / Frontify / etc.) is per-team, so this is a stub.
-@image_agent.tool_plain
-async def brand_asset_lookup(asset_name: str) -> str:
+@image_agent.tool
+async def brand_asset_lookup(ctx: RunContext[AgentDeps], asset_name: str) -> str:
     """Look up an internal brand asset by name (logo, packshot, style guide).
 
     Useful for B2B / agency workflows where the user references known
@@ -811,6 +815,7 @@ def _prepare_run(
     deps = AgentDeps(
         config=config,
         available_images=available_images,
+        task_id=context.task_id or "",
     )
 
     # The active /set parameters are appended to the user prompt so the

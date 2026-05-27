@@ -49,6 +49,13 @@ Issues = "https://github.com/rembli/fast_a2a_app/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.poetry]
+# Poetry is only used here for env + dependency management.
+# Hatchling is the build backend (see [build-system]), so Poetry doesn't
+# need to know the version — without ``package-mode = false`` it rejects
+# the PEP 621 ``dynamic = ["version"]`` declaration.
+package-mode = false
+
 [tool.hatch.version]
 path = "src/fast_a2a_app/_version.py"
 
