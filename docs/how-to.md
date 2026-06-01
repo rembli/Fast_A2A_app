@@ -14,7 +14,7 @@ Task-oriented recipes. For the full surface of each function, see the [API refer
 - [UI rendering conventions](#ui-rendering-conventions)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Choosing a task store](#choosing-a-task-store)
-- [Durable agent execution with DBOS](#durable-agent-execution-with-dbos)
+- [Durable agent execution](#durable-agent-execution)
 - [Debug mode](#debug-mode)
 
 
@@ -743,7 +743,7 @@ build_a2a_app(
 )
 ```
 
-A third hook, `on_task_recover(task_id, task_store)`, fires when the framework detects a `TASK_STATE_WORKING` task whose worker has crashed — covered in [Durable agent execution with DBOS → Crash recovery](#crash-recovery).
+A third hook, `on_task_recover(task_id, task_store)`, fires when the framework detects a `TASK_STATE_WORKING` task whose worker has crashed — covered in [Durable agent execution → Crash recovery](#crash-recovery).
 
 ---
 
@@ -805,48 +805,94 @@ Cross-instance cancel signals flow through the same Protocol, so a custom backen
 
 ---
 
-## Durable agent execution with DBOS
+## Durable agent execution
 
-For agents where a mid-run crash should NOT lose progress — long tool chains, expensive sandbox executions, multi-step workflows — wrap the underlying pydantic-ai `Agent` with [`DBOSAgent`](https://ai.pydantic.dev/durable-execution/dbos/). Every model request and every tool call becomes a checkpointed step in Postgres; on process restart, in-flight workflows resume from the last completed step automatically.
+"Durable" means two different things, and the framework treats them as two layers you opt into independently:
 
-The framework gives you four primitives to plug DBOS into the A2A lifecycle. Skim them once so the recipes below make sense:
+1. **Surface durability** — the A2A task transcript (user messages, agent artifacts, progress log) survives crashes and restarts, and the UI never gets stuck on a `WORKING` task whose worker is gone. This is on by default and needs no extra code.
+2. **Workflow durability** — the *in-flight* agent run resumes from the last completed step after a crash, so model calls and tool calls already paid for aren't repeated. This is opt-in via [DBOS](https://ai.pydantic.dev/durable-execution/dbos/).
+
+The two layers compose: surface durability handles the protocol side regardless of whether the workflow itself is resumable.
+
+### Default behaviour — surface durability, no extra config
+
+Out of the box (any task store, including `MemoryTaskStore`), the framework already gives you:
+
+- **Persisted transcript.** Every artifact and every `report_progress(...)` string is written to the task store as it happens. On reconnect, `SubscribeToTask` replays the log so the UI's spinner picks up where it left off.
+- **Heartbeat-based crash detection.** The executor refreshes a per-task heartbeat every 5 seconds. A task that is still `TASK_STATE_WORKING` more than 30 s after its last heartbeat is treated as crashed.
+- **Lazy crashed-task finalization.** Every `GetTask` / `SubscribeToTask` checks the heartbeat. Stale tasks are finalized as `TASK_STATE_FAILED` with `"Agent worker stopped unexpectedly. Please retry."`, so the UI sees a terminal state instead of hanging.
+- **Cross-instance cancel.** `CancelTask` flows through the task store's `signal_cancel()` / `is_cancel_signalled()` so any replica can stop a task running on any other replica (`MemoryTaskStore` is single-process only — see [Choosing a task store](#choosing-a-task-store)).
+
+What you do **not** get by default: the agent run itself is in-memory. If the worker process dies mid-turn, any model calls and tool calls already completed are wasted — the next attempt starts from scratch. For a 2-second chat reply that's fine. For a 30-second multi-tool plan, it isn't.
+
+To also reconcile stale tasks **at boot** (before any client polls), call [`clean_up_stale_tasks`](api.md#clean_up_stale_tasks) from your lifespan startup:
+
+```python
+from contextlib import asynccontextmanager
+from fast_a2a_app import PostgresTaskStore, clean_up_stale_tasks
+
+@asynccontextmanager
+async def lifespan(app):
+    store = await PostgresTaskStore.from_dsn(POSTGRES_URL)
+    await clean_up_stale_tasks(store)        # finalize anything left WORKING by the previous process
+    try:
+        yield
+    finally:
+        await store.close()
+```
+
+That's the whole default story — persistent backend + this one call covers "crashed worker, UI doesn't hang" without bringing in DBOS.
+
+### Adding workflow durability with DBOS
+
+When mid-run progress is *expensive enough that losing it hurts* — long tool chains, paid LLM calls, sandbox executions that take minutes — wrap the underlying pydantic-ai `Agent` with [`DBOSAgent`](https://ai.pydantic.dev/durable-execution/dbos/). Every model request and every tool call becomes a checkpointed step in Postgres; on process restart, in-flight workflows resume from the last completed step.
+
+Four primitives plug DBOS into the A2A lifecycle:
 
 | Primitive | What it does | Where it runs |
 |---|---|---|
 | `DBOSAgent(agent)` | Wraps a pydantic-ai `Agent`; checkpoints every step. | Inside `stream_invoke` / `invoke`. |
 | `SetWorkflowID(task_id)` | Pins the DBOS workflow ID to the A2A `task_id` so the two share identity. | `with`-block around `.run()`. |
 | [`on_task_cancel`](#lifecycle-hooks) | A2A user-pressed-Stop hook. Cancel the DBOS workflow so it isn't recovered later. | Triggered by the SDK. |
-| [`on_task_recover`](#crash-recovery) + [`clean_up_stale_tasks`](#crash-recovery) | Crash-recovery hook + startup sweeper that route stuck `TASK_STATE_WORKING` tasks through your callback. | App lifespan startup + lazy on `GetTask` / `SubscribeToTask`. |
+| [`on_task_recover`](#crash-recovery) + [`clean_up_stale_tasks`](#crash-recovery) | Crash-recovery hook + startup sweeper. Same primitives as the default flow, just doing more inside the hook. | App lifespan startup + lazy on `GetTask` / `SubscribeToTask`. |
 
-### Quickstart
+#### Step 1 — install and configure DBOS
+
+DBOS needs Postgres. Use the same database as `PostgresTaskStore`: DBOS owns the `dbos` schema, the task store owns bare `a2a_*` tables, they don't collide — and a shared Postgres means either *both* the workflow state and the task transcript survive a crash, or neither does (no split-brain).
 
 ```python
-from dbos import DBOS, DBOSConfig, SetWorkflowID
-from pydantic_ai import Agent
-from pydantic_ai.durable_exec.dbos import DBOSAgent
+from dbos import DBOS, DBOSConfig
 
-# 1) Configure DBOS BEFORE constructing any DBOSAgent — its workflow
+# Configure DBOS BEFORE constructing any DBOSAgent — its workflow
 # registry only sees agents that exist at launch time.
 DBOS(config=DBOSConfig({
     "name": "my_agent",
-    "system_database_url": "postgresql://postgres:postgres@localhost:5432/my_app",
+    "system_database_url": POSTGRES_URL,
 }))
+```
 
-# 2) The wrapped agent needs a stable `name=` — that string identifies
-# the workflow class in the DBOS system database across redeploys.
+#### Step 2 — wrap the agent and pin the workflow ID
+
+```python
+from dbos import SetWorkflowID
+from pydantic_ai import Agent
+from pydantic_ai.durable_exec.dbos import DBOSAgent
+
+# `name=` is the workflow identifier in the DBOS system database — keep it
+# stable across redeploys so in-flight workflows survive a rolling restart.
 my_agent = Agent(model=..., name="my_agent", end_strategy="exhaustive")
 my_agent_durable = DBOSAgent(my_agent)
 
-# 3) Use the durable wrapper in `stream_invoke` / `invoke` — same
-# `.run()` API as a plain Agent. Pin the workflow ID to the A2A
-# task ID so cancellation and recovery can target it by name.
 async def stream_invoke(prompt, context):
+    # Pin the workflow ID to the A2A task_id so cancel/recover hooks can
+    # target it by name. Without this, DBOS assigns a random UUID and
+    # the hooks have nothing to address.
     with SetWorkflowID(context.task_id):
         result = await my_agent_durable.run(prompt, deps=deps)
     yield text_artifact(str(result.output))
 ```
 
-In `main.py`, call `DBOS.launch()` from the FastAPI lifespan startup and `DBOS.destroy()` on shutdown:
+#### Step 3 — launch / destroy DBOS in the lifespan
 
 ```python
 from contextlib import asynccontextmanager
@@ -863,73 +909,24 @@ async def lifespan(_):
 app = FastAPI(lifespan=lifespan)
 ```
 
-### Pairing with `PostgresTaskStore`
+#### Step 4 — wire cancel and recover hooks
 
-DBOS and the A2A `PostgresTaskStore` happily share one Postgres database — DBOS owns the `dbos` schema, the task store owns bare `a2a_*` tables, they don't collide. Use a single `POSTGRES_URL` env var for both:
-
-```python
-from fast_a2a_app import PostgresTaskStore
-
-task_store = await PostgresTaskStore.from_dsn(POSTGRES_URL)
-app.mount("/a2a", build_a2a_app(
-    agent_card=card,
-    stream_invoke=build_stream_invoke(stream_invoke),
-    task_store=task_store,
-))
-```
-
-A shared Postgres also keeps the failure model simple: if Postgres is up, both the durable workflow state *and* the A2A task transcript are intact; if Postgres is down, neither is — no split-brain between the two.
-
-### Cancelling a running DBOS workflow
-
-When a user presses Stop, the A2A framework cancels the in-process `asyncio.Task` and fires `on_task_cancel`. The cancellation only kills the *current* worker's coroutine — without a hook, the DBOS workflow stays `PENDING` in the system database and will be picked up again on the next `DBOS.launch()`. Cancel it explicitly:
+Without these, a Stop click leaves the DBOS workflow `PENDING` (and a future `DBOS.launch()` resumes a workflow whose client is long gone), and a crashed worker leaves the A2A task `WORKING` until a client polls.
 
 ```python
-from dbos import DBOS, SetWorkflowID
+from a2a.types import TaskState
+from dbos import DBOS
+from fast_a2a_app import PostgresTaskStore, clean_up_stale_tasks
 
 async def cancel_agent_workflow(context_id: str, task_id: str) -> None:
     if task_id:
         await DBOS.cancel_workflow_async(task_id)
 
-async def stream_invoke(prompt, context):
-    with SetWorkflowID(context.task_id):                       # ⬅ same ID the hook will use
-        result = await my_agent_durable.run(prompt, deps=deps)
-    yield text_artifact(str(result.output))
-
-build_a2a_app(
-    ...,
-    on_task_cancel=cancel_agent_workflow,
-)
-```
-
-The `SetWorkflowID(context.task_id)` line is what makes this work — without it, the DBOS-assigned UUID is unrelated to the A2A `task_id` and the hook has nothing to target.
-
-### Crash recovery
-
-DBOS resumes workflows from the last completed step on restart, but the surrounding A2A task is a separate concern: it can still be `TASK_STATE_WORKING` from the dead worker's perspective, with a UI tab somewhere waiting on a terminal event that's never coming. The framework detects this two ways:
-
-* **Lazy** — on every `GetTask` / `SubscribeToTask`, the request handler checks the per-task heartbeat (refreshed by `report_progress` and the executor itself). A task `WORKING` for more than 30 seconds with no live writer is treated as crashed.
-* **Eager** — call [`clean_up_stale_tasks(task_store, on_task_recover=...)`](api.md#clean_up_stale_tasks) from the lifespan after `DBOS.launch()` so stuck tasks are reconciled at boot, without waiting for a client to poll.
-
-Both paths flow into `on_task_recover(task_id, task_store)`. The hook is advisory: do whatever agent-side cleanup you need; the framework then default-finalizes the task as `TASK_STATE_FAILED` with a generic "please retry" message. `finalize_task` is idempotent at the store layer, so if your hook already wrote a terminal state it stays intact.
-
-You pick the recovery policy by what the hook does. Two patterns cover almost all cases.
-
-**Policy A — give up the in-flight task.** Cancel the workflow so DBOS doesn't keep replaying it, and let the framework's default `FAILED` finalize unstick the UI:
-
-```python
-from dbos import DBOS
-from fast_a2a_app import clean_up_stale_tasks
-
 async def recover_agent_workflow(task_id: str, task_store) -> None:
-    # The workflow ID was pinned to task_id via SetWorkflowID — cancel it
-    # so a fresh DBOS.launch() doesn't resume an orphan workflow whose
-    # client is long gone.
+    # Workflow ID was pinned to task_id via SetWorkflowID — cancel it so a
+    # fresh DBOS.launch() doesn't resume an orphan whose client is gone.
+    # The framework then default-finalizes the A2A task as FAILED.
     await DBOS.cancel_workflow_async(task_id)
-    # Optional: emit telemetry, write a tailored status_message via
-    # task_store.finalize_task(... TASK_STATE_FAILED, status_message=...).
-    # If you don't, the framework writes "Agent worker stopped unexpectedly.
-    # Please retry." for you.
 
 @asynccontextmanager
 async def lifespan(app):
@@ -942,16 +939,20 @@ async def lifespan(app):
         await store.close()
         DBOS.destroy(workflow_completion_timeout_sec=30)
 
-build_a2a_app(
-    ...,
+app.mount("/a2a", build_a2a_app(
+    agent_card=card,
+    stream_invoke=build_stream_invoke(stream_invoke),
     task_store=store,
+    on_task_cancel=cancel_agent_workflow,
     on_task_recover=recover_agent_workflow,    # also fires lazily on GetTask/Subscribe
-)
+))
 ```
 
-This is the right default for most apps — DBOS still gives you "no duplicate work" (cached steps are reused if the user re-asks the same question via a `result_cache`), but the original A2A task ends cleanly instead of a recovered DBOS workflow racing the user's retry.
+This is **Policy A — give up the in-flight task.** DBOS still gives you "no duplicate work" if the user re-asks the same question (a `result_cache` keyed by input hash reuses cached steps), but the original A2A task ends cleanly instead of a recovered DBOS workflow racing the user's retry. It's the right default for most apps.
 
-**Policy B — actively resume the task on a fresh worker.** Some workflows are too expensive to discard and re-ask. In that case the hook re-drives the agent end-to-end and writes its own terminal state. This needs [`bind_executor`](api.md#bind_executor) so `report_progress(...)` from inside the resumed run lands on the right task in the store and reaches any still-subscribed UI:
+#### Step 5 (optional) — Policy B: actively resume the task on a fresh worker
+
+If discarding the task and asking the user to retry is *worse* than spending the compute to resume in the background, swap the recover hook for one that re-drives the agent end-to-end and writes its own terminal state. This needs [`bind_executor`](api.md#bind_executor) so `report_progress(...)` from inside the resumed run lands on the right task in the store and reaches any still-subscribed UI:
 
 ```python
 from a2a.types import TaskState
@@ -966,8 +967,8 @@ async def recover_agent_workflow(task_id: str, task_store) -> None:
     async with bind_executor(task_id, task_store):
         report_progress("Resuming after restart…")
         artifacts = []
-        # DBOSAgent.run inside stream_invoke will replay cached steps and
-        # only re-execute the ones that hadn't checkpointed.
+        # DBOSAgent.run inside stream_invoke replays cached steps and
+        # only re-executes the ones that hadn't checkpointed.
         async for chunk in stream_invoke(prompt, context):
             if not isinstance(chunk, str):
                 artifacts.append(chunk)
@@ -979,7 +980,7 @@ async def recover_agent_workflow(task_id: str, task_store) -> None:
     )
 ```
 
-`bind_executor` sets the request-scoped `ContextVar`s that `report_progress` reads, mirroring what the executor does inside a normal request. Without it, a recovered run still completes (DBOS doesn't care about progress strings) but the UI sees nothing between "Resuming…" and the terminal event.
+Without `bind_executor`, a recovered run still completes (DBOS doesn't care about progress strings) but the UI sees nothing between "Resuming…" and the terminal event.
 
 ### Watching workflows live with dbos-argus
 
@@ -994,6 +995,8 @@ It shows parent/child workflow trees, step status (`PENDING` / `SUCCESS` / `ERRO
 
 ### What is and isn't durable
 
+With DBOS:
+
 | Replayed on recovery | NOT replayed on recovery |
 |---|---|
 | Model requests (cached completions) | Tool side effects on `ctx.deps` (in-memory dataclass) |
@@ -1007,6 +1010,17 @@ Tools that mutate `ctx.deps` (e.g. appending to a `deps.generated` artifact list
 3. **Accept the degradation.** The recovered workflow still produces the same final text reply — just without the inline tables / charts the already-completed tools would have appended to `deps.generated`.
 
 `report_progress` strings are deliberately *not* durable: they're UX, not state. If a worker crashes mid-run, the persisted log up to the crash is still replayed to any client that reconnects (that's the task store's job), but a *recovered* DBOS workflow doesn't re-emit them — use Policy B above with an explicit `report_progress("Resuming…")` if you want a UI heartbeat during the resume.
+
+### When to use what
+
+| Situation | Reach for |
+|---|---|
+| Local dev, demos, single-process. | Default (`MemoryTaskStore`). Crashes lose the task but you're restarting anyway. |
+| Production chat: short turns, multi-replica, cheap to retry. | Persistent task store (`Redis` / `Mongo` / `Postgres`) + `clean_up_stale_tasks` in lifespan. No DBOS. |
+| Long tool chains, expensive LLM calls, multi-minute sandbox runs — losing mid-run progress is painful but the user can re-ask. | DBOS + Policy A (cancel orphan workflow, let the framework finalize FAILED). |
+| Background jobs the user can't easily retry (scheduled runs, queue-triggered work, agent-to-agent calls with no UI in the loop). | DBOS + Policy B (`on_task_recover` re-drives via `bind_executor` and finalizes COMPLETED). |
+
+Start at the row that matches your deployment and only move down when a concrete failure mode bites. DBOS is great when you need it and overhead when you don't — a persistent task store alone already covers crash visibility for the protocol layer.
 
 ---
 

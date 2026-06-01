@@ -140,12 +140,22 @@ def _message_pairs(messages: Iterable[object], role: str) -> list[tuple[str, str
 
 
 def _task_pairs(task: object) -> list[tuple[str, str]]:
+    # Only USER-role entries from history are real conversation. The A2A
+    # SDK's TaskManager auto-appends ``task.status.message`` to
+    # ``task.history`` on every TaskStatusUpdateEvent (see
+    # a2a.server.tasks.task_manager.save_task_event), so every
+    # ``report_progress`` tick lands here as an agent-role message. If we
+    # surfaced those, a long turn's progress noise ("Step 28 (45s):
+    # Running Python #2…") would fill the ``format_history`` cap and
+    # crowd out the actual user prompts and final agent replies — the
+    # LLM would see only ticks and act as if it had no memory of the
+    # conversation. Real agent text lives on ``task.artifacts``.
     pairs: list[tuple[str, str]] = []
     history = getattr(task, "history", None) or []
     for message in history:
-        role_int = getattr(message, "role", 0)
-        role = "user" if role_int == Role.ROLE_USER else "agent"
-        pairs.extend(_message_pairs([message], role))
+        if getattr(message, "role", 0) != Role.ROLE_USER:
+            continue
+        pairs.extend(_message_pairs([message], "user"))
     artifacts = getattr(task, "artifacts", None) or []
     for artifact in artifacts:
         for text in _message_texts(artifact):
