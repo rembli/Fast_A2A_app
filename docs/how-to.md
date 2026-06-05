@@ -595,6 +595,9 @@ The discriminator pattern follows the Pydantic convention: a leading-underscore 
 |-----------------------|---------------------------------|------------------------------------------------------------------------|
 | `TABLE`               | `table_artifact(...)`           | A real HTML `<table>` with column headers, alternating row shading, right-aligned monospace numerics, em-dash for nulls, and horizontal-scroll for wide schemas. |
 | `PROMPT_SUGGESTIONS`  | `prompt_suggestions_artifact(...)` | A row of clickable pill buttons. Clicking a pill sends the suggestion's `prompt` text as a normal user message. |
+| `MAP`                 | `map_artifact(...)`             | Interactive Leaflet/OSM map with markers; Leaflet is lazy-loaded from a public CDN on first map render. |
+| `DOCUMENT`            | `document_artifact(...)`        | Inline card with a thumbnail viewer, prev/next chrome, filename + size pills, and a download chip. Click-to-expand fullscreen page reader when `pages` is non-empty. |
+| `DOCUMENTS`           | `documents_artifact(...)`       | Fixed right-edge workspace panel listing every file with size/mtime, per-row version history, and download chips. Updates in place across turns. |
 | *(none)*              | `data_artifact(...)`            | Generic key-value block: one row per top-level key, types coloured (string / number / bool / null / object). For arbitrary JSON-shaped state. |
 
 Every envelope can be paired with a `text` / `caption` argument that's rendered as a markdown caption immediately above the widget.
@@ -640,6 +643,70 @@ Common patterns:
 - **Closing pills** at the end of every turn — see `examples/holiday-planner`, which generates them dynamically from the conversation context rather than using a fixed list.
 - **Slash-command shortcuts** — wire labels to `"/help"`, `"/clear"`, etc., so a new user can discover commands without typing them.
 - **Multi-step routing** — instead of asking the user a free-form clarification, offer 2–3 enumerated branches the agent can switch on next turn.
+
+### `document_artifact` — inline document viewer
+
+Use this when the agent has produced one or more concrete Office / PDF documents the user should look at *right now*. The card shows a thumbnail, filename + size pills, prev/next chrome (hidden when there's only one document), and a download chip. When a document carries a non-empty `pages` list the thumbnail becomes clickable and opens a fullscreen modal that vertically stacks every page for native-scroll reading.
+
+```python
+from fast_a2a_app import document_artifact
+
+async def stream_invoke(prompt: str):
+    yield document_artifact(
+        [
+            {
+                "filename": "quarterly-update.pptx",
+                "downloadUrl": "/download/ctx/quarterly-update.pptx",
+                "thumbnailUrl": "/download/ctx/.previews/qu/slide-1.png",
+                "pages": [
+                    "/download/ctx/.previews/qu/slide-1.png",
+                    "/download/ctx/.previews/qu/slide-2.png",
+                ],
+                "mediaType": (
+                    "application/vnd.openxmlformats-officedocument"
+                    ".presentationml.presentation"
+                ),
+                "sizeBytes": 31415,
+            },
+        ],
+        caption="Here's the deck.",
+    )
+```
+
+`downloadUrl`, `thumbnailUrl`, `pages`, `mediaType`, and `sizeBytes` are all optional — drop `thumbnailUrl` / `pages` for a download-only card.
+
+### `documents_artifact` — always-on workspace panel
+
+Distinct from `document_artifact`: instead of pushing a new card into the chat scroll, this artifact maintains a fixed right-edge side panel that mirrors the current workspace contents. Emit it at the end of every turn (after any file mutation) so the panel stays in sync without the user having to ask. Each row gets an icon (chosen from the extension), filename, size · mtime caption, an optional version-history toggle, and a download chip; clicking a row sends `/view <filename>` as the next user message — wire that command on the agent side to surface the file as a `DOCUMENT` card.
+
+```python
+from fast_a2a_app import documents_artifact
+
+yield documents_artifact(
+    [
+        {
+            "filename": "quarterly-update.pptx",
+            "downloadUrl": "/download/ctx/quarterly-update.pptx",
+            "sizeBytes": 31415,
+            "modifiedAt": "2026-05-22T23:04:50Z",
+            "viewable": True,
+            "versions": [
+                {
+                    "filename":
+                        "quarterly-update.20260522T230450123456.pptx",
+                    "downloadUrl":
+                        "/download/ctx/.versions/"
+                        "quarterly-update.20260522T230450123456.pptx",
+                    "sizeBytes": 30912,
+                    "modifiedAt": "2026-05-22T23:04:50Z",
+                },
+            ],
+        },
+    ],
+)
+```
+
+`viewable=False` hides the in-chat preview affordance for files the agent only knows how to hand back as a download. `versions` is a newest-first list of prior revisions surfaced behind a small `vN ▸` toggle on each row; version rows send `/view .versions/<filename>` when clicked, so the agent's `/view` handler should accept that one-segment `.versions/` prefix and surface the historical file in a `DOCUMENT` card.
 
 ### `data_artifact` — generic key-value (fallback)
 

@@ -4,6 +4,8 @@ from .artifacts import (
     ArtifactTypeRegistry,
     artifact_types,
     data_artifact,
+    document_artifact,
+    documents_artifact,
     file_artifact,
     image_artifact,
     map_artifact,
@@ -54,6 +56,8 @@ __all__ = [
     "file_artifact",
     "image_artifact",
     "prompt_suggestions_artifact",
+    "document_artifact",
+    "documents_artifact",
     # Artifact-type registry (extending the chat UI with new typed widgets)
     "ArtifactType",
     "ArtifactTypeRegistry",

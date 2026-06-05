@@ -176,11 +176,14 @@ Each ships with a matching JS renderer in `fast_a2a_app/ui/renderers/<TAG>.js`. 
 | `table_artifact(rows, *, columns=None, caption=None, name="table")` | `"TABLE"` | Real HTML `<table>` — column headers, alternating row shading, right-aligned monospace numerics, em-dash for nulls, horizontal-scroll for wide schemas |
 | `prompt_suggestions_artifact(suggestions, *, text=None, name="prompt_suggestions")` | `"PROMPT_SUGGESTIONS"` | Row of clickable pill buttons; click submits the suggestion's `prompt` as the next user message. Clicked pill is highlighted (visual breadcrumb) and siblings dim. |
 | `map_artifact(markers, *, center=None, zoom=None, caption=None, name="map")` | `"MAP"` | Interactive Leaflet/OpenStreetMap map (Leaflet lazy-loaded from CDN on first map). `markers` is `[{lat, lng, label?, popup?}, …]`; invalid coords dropped silently. |
+| `document_artifact(documents, *, caption=None, name="document")` | `"DOCUMENT"` | Inline card with a thumbnail viewer, prev/next chrome (hidden when only one document), filename + size pills, and a download chip. When a document carries a non-empty `pages` list the thumbnail becomes click-to-expand and opens a fullscreen modal that vertically stacks every page for native-scroll reading. |
+| `documents_artifact(documents, *, name="documents")` | `"DOCUMENTS"` | Fixed right-edge workspace panel listing every file with size/mtime, per-row version-history toggle (`v3 ▸` expands a sub-list), and download chips. Updates in place across turns instead of pushing a new card — emit at the end of every turn to mirror current workspace state. |
 
 ```python
 from fast_a2a_app import (
     text_artifact, data_artifact, file_artifact, image_artifact,
     table_artifact, prompt_suggestions_artifact, map_artifact,
+    document_artifact, documents_artifact,
 )
 
 async def stream_invoke(prompt, context):
@@ -199,6 +202,20 @@ async def stream_invoke(prompt, context):
         [{"label": "Drill into APAC", "prompt": "Break down APAC by country."}],
         text="What next?",
     )
+    yield document_artifact(
+        [{
+            "filename": "report.pdf",
+            "downloadUrl": "/download/ctx/report.pdf",
+            "thumbnailUrl": "/download/ctx/.previews/report/page-1.png",
+            "pages": ["/download/ctx/.previews/report/page-1.png"],
+        }],
+        caption="Here's the rendered report.",
+    )
+    yield documents_artifact(
+        [{"filename": "report.pdf",
+          "downloadUrl": "/download/ctx/report.pdf",
+          "sizeBytes": 31415}],
+    )
 ```
 
 ### URL form vs. inline bytes
@@ -214,7 +231,7 @@ from fast_a2a_app import artifact_types, ArtifactType, ArtifactTypeRegistry
 
 # Built-ins after import:
 [t.tag for t in artifact_types.all()]
-# → ['MAP', 'PROMPT_SUGGESTIONS', 'TABLE']
+# → ['DOCUMENT', 'DOCUMENTS', 'MAP', 'PROMPT_SUGGESTIONS', 'TABLE']
 
 # Register your own at runtime:
 artifact_types.register("MYAPP_TIMELINE", builder=timeline_artifact)

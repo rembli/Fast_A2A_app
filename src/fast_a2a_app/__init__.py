@@ -78,6 +78,8 @@ from .server import (
     build_stream_invoke,
     clean_up_stale_tasks,
     data_artifact,
+    document_artifact,
+    documents_artifact,
     file_artifact,
     format_history,
     get_task_history,
@@ -110,6 +112,8 @@ __all__ = [
     "file_artifact",
     "image_artifact",
     "prompt_suggestions_artifact",
+    "document_artifact",
+    "documents_artifact",
     # Artifact-type registry (extending the chat UI with new typed widgets)
     "ArtifactType",
     "ArtifactTypeRegistry",

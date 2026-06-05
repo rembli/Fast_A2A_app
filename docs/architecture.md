@@ -127,6 +127,8 @@ Artifacts are A2A's payload shape: a name plus a list of `Part`s, where each par
 | `TABLE` | `table_artifact(rows, columns=…, caption=…)` | Real HTML `<table>` with column headers, alternating row shading, right-aligned numerics, em-dash for nulls |
 | `PROMPT_SUGGESTIONS` | `prompt_suggestions_artifact([{label, prompt}, …], text=…)` | Row of clickable pill buttons; click sends the suggestion as the next user message |
 | `MAP` | `map_artifact(markers, *, center=…, zoom=…, caption=…)` | Interactive Leaflet/OSM map (Leaflet lazy-loaded from CDN on first map render) |
+| `DOCUMENT` | `document_artifact(documents, *, caption=…)` | Inline card with thumbnail viewer, prev/next chrome, download chip, and click-to-expand fullscreen page reader |
+| `DOCUMENTS` | `documents_artifact(documents)` | Fixed right-edge workspace panel listing every file with size/mtime, per-row version history, and download chips — updates in place across turns |
 
 Tags without a matching `<TAG>.js` fall through to the generic key-value renderer, so a Python-only registration still produces something usable.
 
@@ -134,11 +136,13 @@ Tags without a matching `<TAG>.js` fall through to the generic key-value rendere
 fast_a2a_app/server/artifacts/        fast_a2a_app/ui/renderers/
 ├── __init__.py        (registry +    ├── TABLE.js
 │   autodiscover)                     ├── PROMPT_SUGGESTIONS.js
-├── _core.py           (text/data/    └── MAP.js
-│   file/image)
-├── TABLE.py
+├── _core.py           (text/data/    ├── MAP.js
+│   file/image)                       ├── DOCUMENT.js
+├── TABLE.py                          └── DOCUMENTS.js
 ├── PROMPT_SUGGESTIONS.py
-└── MAP.py
+├── MAP.py
+├── DOCUMENT.py
+└── DOCUMENTS.py
 ```
 
 Adding a new typed widget is one file on each side; the registry, `__init__.py`, and `index.html` need no edits. See [How-to → Adding a new typed widget](how-to.md#adding-a-new-typed-widget).

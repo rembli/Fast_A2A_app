@@ -189,6 +189,8 @@ __all__ = [
     "map_artifact",
     "table_artifact",
     "prompt_suggestions_artifact",
+    "document_artifact",
+    "documents_artifact",
     # Artifact-type registry.
     "ArtifactType",
     "ArtifactTypeRegistry",
