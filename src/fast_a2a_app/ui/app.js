@@ -39,6 +39,8 @@ const A2A_HEADERS      = { 'Content-Type': 'application/json', 'A2A-Version': '1
 const UI_CONFIG = (typeof window !== 'undefined' && window.UI_CONFIG) || {};
 const FILE_UPLOAD_API = (UI_CONFIG.fileUploadApi || '').trim() || null;
 const ACCEPTED_FILE_TYPES = (UI_CONFIG.acceptedFileTypes || '').trim();
+const LOGIN_URL  = (UI_CONFIG.loginUrl  || '').trim() || null;
+const LOGOUT_URL = (UI_CONFIG.logoutUrl || '').trim() || null;
 
 // ── marked setup ─────────────────────────────────────────────────────────────
 marked.use({ breaks: true, gfm: true });
@@ -176,6 +178,70 @@ restoreTranscript();
 fetchAgentCard().then(maybeAutoHello);
 resumeActiveTaskOnLoad();
 
+// Auth link: shown only when the host app configured login_url / logout_url
+// on build_a2a_ui(). The framework itself owns no auth — it just renders
+// the link the host points it at. Sign-out is preferred when both are set
+// (a sign-in is meaningless once authed); the host should configure only
+// the relevant one for the request, or leave both set and accept the
+// "sign-out always visible" behaviour.
+(function setupAuthLink() {
+  const $authLink = document.getElementById('auth-link');
+  if (!$authLink) return;
+  if (LOGOUT_URL) {
+    $authLink.textContent = 'Sign out';
+    $authLink.href = LOGOUT_URL;
+    $authLink.classList.remove('hidden');
+  } else if (LOGIN_URL) {
+    $authLink.textContent = 'Sign in';
+    $authLink.href = LOGIN_URL;
+    $authLink.classList.remove('hidden');
+  }
+})();
+
+// ── Auth (401) handling ──────────────────────────────────────────────────────
+// The framework owns no auth itself — but a host app may sit a 401 gate in
+// front of /a2a/. When that fires we convert the generic "HTTP 401" thrown
+// by the fetch sites into a typed error the outer turn-runner recognises
+// and renders as a friendly "this agent requires sign-in" panel with a CTA
+// link to LOGIN_URL (when configured).
+class SignInRequiredError extends Error {
+  constructor() {
+    super('Sign-in required');
+    this.name = 'SignInRequired';
+  }
+}
+
+function throwIfUnauthorized(response) {
+  if (response.status === 401) throw new SignInRequiredError();
+}
+
+function renderSignInRequired() {
+  // One bubble explaining the gate + a sign-in CTA when the host
+  // supplied login_url. We don't auto-redirect — that would clobber
+  // any user state on the page (typed input, scroll position).
+  const wrap = el('div', 'flex justify-start');
+  const inner = el(
+    'div',
+    'bg-amber-50 border border-amber-200 rounded-2xl rounded-tl-sm ' +
+    'px-4 py-3 shadow-sm text-sm text-amber-900 max-w-md flex flex-col gap-3',
+  );
+  const msg = el('div', '');
+  msg.textContent = 'This agent requires you to sign in before it can respond.';
+  inner.appendChild(msg);
+  if (LOGIN_URL) {
+    const cta = document.createElement('a');
+    cta.href = LOGIN_URL;
+    cta.textContent = 'Sign in';
+    cta.className =
+      'self-start bg-amber-600 hover:bg-amber-700 text-white text-xs ' +
+      'font-medium px-3 py-1.5 rounded-md transition no-underline';
+    inner.appendChild(cta);
+  }
+  wrap.appendChild(inner);
+  $msgs.appendChild(wrap);
+  scrollEnd();
+}
+
 // ── Events ───────────────────────────────────────────────────────────────────
 document.getElementById('new-chat-btn').addEventListener('click', () => {
   contextId = genUUID();
@@ -290,6 +356,8 @@ async function runTurn(parts, thinkEl) {
     removeAllThinking();
     if (err.name === 'UserStop') {
       sysMsg('Task stopped.');
+    } else if (err.name === 'SignInRequired') {
+      renderSignInRequired();
     } else {
       console.error('[a2a] turn failed:', err);
       errorMsg(err.message || String(err));
@@ -377,6 +445,7 @@ async function sendAndStream(parts, thinkEl) {
   });
 
   try {
+    throwIfUnauthorized(sendResp);
     if (!sendResp.ok) throw new Error(`HTTP ${sendResp.status}`);
     if (!sendResp.body) throw new Error('Streaming response body missing.');
 
@@ -434,6 +503,7 @@ async function sendNonStreaming(parts, thinkEl) {
     body: JSON.stringify(body),
   });
 
+  throwIfUnauthorized(response);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
   const data = await response.json();

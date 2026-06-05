@@ -96,6 +96,8 @@ def build_a2a_ui(
     *,
     file_upload_api: str | None = None,
     accepted_file_types: Iterable[str] | str | None = None,
+    login_url: str | None = None,
+    logout_url: str | None = None,
 ) -> Starlette:
     """Build a chat UI Starlette app with the given configuration.
 
@@ -113,10 +115,25 @@ def build_a2a_ui(
             (``image/png,image/jpeg,image/webp,image/gif``) so existing
             callers keep their behaviour. Ignored when
             ``file_upload_api`` is ``None``.
+        login_url: When set, the chat header renders a "Sign in" link
+            pointing here, and a 401 response from ``/a2a/`` swaps the
+            chat into a "this agent requires login" state with a CTA
+            linking to this URL. The framework itself does no auth —
+            this is just the URL of the auth route owned by the host
+            FastAPI app.
+        logout_url: When set, the chat header renders a "Sign out" link
+            pointing here (replaces the "Sign in" link when both are
+            provided — typical for a "show sign-in until authed, sign-out
+            after" UX is to swap the env per-request, but the simpler
+            and more common shape is "always show sign-out when the
+            framework wires both", which matches what server-side
+            template gating expects).
     """
     config = {
         "fileUploadApi": file_upload_api,
         "acceptedFileTypes": _normalise_accepted_file_types(accepted_file_types),
+        "loginUrl": (login_url or "").strip() or None,
+        "logoutUrl": (logout_url or "").strip() or None,
         "libraryVersion": _LIBRARY_VERSION,
     }
     config_js = f"window.UI_CONFIG = {json.dumps(config)};"
