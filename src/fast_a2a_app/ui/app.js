@@ -52,7 +52,6 @@ function renderMarkdown(text) {
 
 // ── State ────────────────────────────────────────────────────────────────────
 let contextId        = localStorage.getItem(CID_STORAGE_KEY) || genUUID();
-const isFreshContext = !localStorage.getItem(CID_STORAGE_KEY);
 let busy             = false;
 let streamController = null;
 let userStopped      = false;
@@ -175,41 +174,8 @@ if (!FILE_UPLOAD_API) {
   // still validates server-side — this is just UX hygiene.
   $fileInput.accept = ACCEPTED_FILE_TYPES;
 }
-// Identity-transition handshake: when the host redirects ``/auth/callback``
-// (sign-in success) OR ``/auth/signout`` to ``/?fresh_chat=1`` the chat UI
-// treats it as the start of a new session — wipe any stale browser-side
-// chat state from a previous identity, strip the marker from the URL, and
-// force an explicit ``/hello`` after the agent card loads (bypassing
-// ``maybeAutoHello``, which only fires for genuinely fresh-cold contexts).
-//
-// Same handshake for both transitions because the desired surface is the
-// same — a fresh chat with the agent's welcome already showing. After
-// sign-OUT the welcome /hello will hit a 401 (cookie just cleared) and
-// the UI swaps it for the "sign-in required" panel; after sign-IN the
-// /hello succeeds and renders the overview.
-const freshChat = (function detectFreshChat() {
-  let url;
-  try { url = new URL(window.location.href); }
-  catch (_) { return false; }
-  if (url.searchParams.get('fresh_chat') !== '1') return false;
-  resetBrowserChatState();
-  url.searchParams.delete('fresh_chat');
-  const clean = url.pathname + (url.search ? url.search : '') + url.hash;
-  window.history.replaceState({}, '', clean);
-  return true;
-})();
-
 restoreTranscript();
-fetchAgentCard().then(() => {
-  if (freshChat) {
-    // We just crossed an identity boundary (sign-in or sign-out) — auto-
-    // fire /hello regardless of the boot-time ``isFreshContext`` value.
-    // The reset above already gave us a fresh contextId + empty transcript.
-    sendSlashCommand('/hello').catch(() => {});
-    return;
-  }
-  return maybeAutoHello();
-});
+fetchAgentCard().then(maybeAutoHello);
 resumeActiveTaskOnLoad();
 
 // Auth link: rendered as "Sign in" or "Sign out" depending on the
@@ -233,15 +199,14 @@ function setAuthLink(authenticated) {
     $fresh.textContent = 'Sign out';
     $fresh.href = LOGOUT_URL;
     $fresh.classList.remove('hidden');
-    // Sign-out hard-resets the browser-side chat: a new context id, no
-    // transcript, no pending uploads, no resumable task. Otherwise the
-    // next user on this browser (or the same user signing back in)
-    // would see the previous person's conversation. We clear FIRST
-    // and only navigate to LOGOUT_URL once cleanup completed — the
-    // server-side session is dropped by the host's /auth/signout route.
+    // Sign-out wipes every per-tab chat artefact from localStorage before
+    // navigating to LOGOUT_URL. The post-redirect page-boot then runs
+    // ``restoreTranscript()`` → empty → ``maybeAutoHello()`` → ``/hello``,
+    // which (because the cookie was just cleared) 401s and the UI swaps
+    // it for the friendly "this agent requires sign-in" panel.
     $fresh.addEventListener('click', (event) => {
       event.preventDefault();
-      resetBrowserChatState();
+      wipeBrowserChatState();
       window.location.href = LOGOUT_URL;
     });
   } else if (!authenticated && LOGIN_URL) {
@@ -253,16 +218,14 @@ function setAuthLink(authenticated) {
   }
 }
 
-function resetBrowserChatState() {
-  // Stronger than the "+ New chat" reset: that one only forgets the
-  // *current* transcript and leaks earlier ones (the transcript key is
-  // ``a2a_transcript:<cid>`` — see transcriptStorageKey). Here we sweep
-  // EVERY a2a_transcript:* entry so nothing from a prior identity
-  // persists across the next sign-in. Used by:
-  //   * the Sign-out click handler (followed by navigation to LOGOUT_URL)
-  //   * the just-signed-in boot path (followed by an explicit /hello)
+// Wipe every per-tab chat artefact from localStorage AND the in-memory
+// state machine. Used by the Sign-out click handler (caller navigates
+// away immediately after, so we don't bother assigning a fresh contextId
+// — the post-redirect page boot generates one on its own). Leaving
+// localStorage empty is what makes ``loadTranscript()`` come back empty
+// on next boot, which is the only condition ``maybeAutoHello`` checks.
+function wipeBrowserChatState() {
   try {
-    clearTranscript();
     clearActiveTask();
     clearPendingFiles();
     fullscreenImages = [];
@@ -270,20 +233,24 @@ function resetBrowserChatState() {
     suggestionsByTaskId.clear();
     if (fullscreenOpen) closeFullscreen();
 
-    // Sweep orphaned transcripts from earlier "+ New chat" sessions.
-    const orphans = [];
+    // Sweep the contextId pointer, the active-task pointer, and every
+    // ``a2a_transcript:<cid>`` shard (including ones orphaned by earlier
+    // "+ New chat" clicks).
+    const wipe = [];
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (key && key.startsWith(`${TRANSCRIPT_KEY}:`)) orphans.push(key);
+      if (!key) continue;
+      if (
+        key === CID_STORAGE_KEY ||
+        key === ACTIVE_TASK_KEY ||
+        key.startsWith(`${TRANSCRIPT_KEY}:`)
+      ) {
+        wipe.push(key);
+      }
     }
-    orphans.forEach((key) => localStorage.removeItem(key));
-
-    // Fresh context id LAST, after the per-cid transcript above is gone,
-    // so the next sign-in lands on a brand-new conversation.
-    contextId = genUUID();
-    persist(contextId);
+    wipe.forEach((key) => localStorage.removeItem(key));
   } catch (err) {
-    console.warn('[a2a] sign-out reset failed; proceeding to redirect:', err);
+    console.warn('[a2a] chat-state wipe failed:', err);
   }
 }
 
@@ -432,11 +399,16 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') navFullscreen(+1);
 });
 
-// Auto-send /hello on first load when there is no transcript (cold start).
+// Auto-send /hello whenever the restored transcript is empty. This covers
+// every "fresh surface" case identically — first ever visit, a "+ New chat"
+// reset, a post-sign-out wipe, or a sign-in to a brand new browser — and
+// avoids special-case URL markers between server and client. The host's
+// auth routes don't need to set any flag; they just clear the cookie (and
+// the sign-out click handler wipes localStorage so the transcript IS empty
+// on the next boot).
 async function maybeAutoHello() {
-  const hasTranscript = loadTranscript().length > 0;
-  if (hasTranscript || busy) return;
-  if (!isFreshContext) return;
+  if (busy) return;
+  if (loadTranscript().length > 0) return;
   await sendSlashCommand('/hello').catch(() => {});
 }
 
