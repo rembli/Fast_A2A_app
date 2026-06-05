@@ -98,6 +98,7 @@ def build_a2a_ui(
     accepted_file_types: Iterable[str] | str | None = None,
     login_url: str | None = None,
     logout_url: str | None = None,
+    auth_status_url: str | None = None,
 ) -> Starlette:
     """Build a chat UI Starlette app with the given configuration.
 
@@ -115,25 +116,29 @@ def build_a2a_ui(
             (``image/png,image/jpeg,image/webp,image/gif``) so existing
             callers keep their behaviour. Ignored when
             ``file_upload_api`` is ``None``.
-        login_url: When set, the chat header renders a "Sign in" link
-            pointing here, and a 401 response from ``/a2a/`` swaps the
-            chat into a "this agent requires login" state with a CTA
-            linking to this URL. The framework itself does no auth —
-            this is just the URL of the auth route owned by the host
-            FastAPI app.
-        logout_url: When set, the chat header renders a "Sign out" link
-            pointing here (replaces the "Sign in" link when both are
-            provided — typical for a "show sign-in until authed, sign-out
-            after" UX is to swap the env per-request, but the simpler
-            and more common shape is "always show sign-out when the
-            framework wires both", which matches what server-side
-            template gating expects).
+        login_url: URL the chat UI navigates to when the user clicks the
+            header "Sign in" link or the "Sign in" CTA inside the
+            "agent requires sign-in" panel that appears after a 401
+            response from ``/a2a/``.
+        logout_url: URL the chat UI navigates to when the user clicks the
+            header "Sign out" link. The link is shown only after a
+            probe of ``auth_status_url`` confirms an authenticated
+            session — otherwise the header shows "Sign in".
+        auth_status_url: Optional read-only endpoint the chat UI polls
+            on boot (and after a 401) to determine which link to render
+            in the header. It must respond ``200`` with JSON
+            ``{"authenticated": bool}`` for every caller — no auth
+            middleware on this path. Without it the header falls back
+            to showing "Sign in" (if ``login_url`` is configured) so
+            unauthenticated users aren't presented with a misleading
+            "Sign out".
     """
     config = {
         "fileUploadApi": file_upload_api,
         "acceptedFileTypes": _normalise_accepted_file_types(accepted_file_types),
         "loginUrl": (login_url or "").strip() or None,
         "logoutUrl": (logout_url or "").strip() or None,
+        "authStatusUrl": (auth_status_url or "").strip() or None,
         "libraryVersion": _LIBRARY_VERSION,
     }
     config_js = f"window.UI_CONFIG = {json.dumps(config)};"

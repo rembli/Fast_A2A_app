@@ -39,8 +39,9 @@ const A2A_HEADERS      = { 'Content-Type': 'application/json', 'A2A-Version': '1
 const UI_CONFIG = (typeof window !== 'undefined' && window.UI_CONFIG) || {};
 const FILE_UPLOAD_API = (UI_CONFIG.fileUploadApi || '').trim() || null;
 const ACCEPTED_FILE_TYPES = (UI_CONFIG.acceptedFileTypes || '').trim();
-const LOGIN_URL  = (UI_CONFIG.loginUrl  || '').trim() || null;
-const LOGOUT_URL = (UI_CONFIG.logoutUrl || '').trim() || null;
+const LOGIN_URL       = (UI_CONFIG.loginUrl       || '').trim() || null;
+const LOGOUT_URL      = (UI_CONFIG.logoutUrl      || '').trim() || null;
+const AUTH_STATUS_URL = (UI_CONFIG.authStatusUrl  || '').trim() || null;
 
 // ── marked setup ─────────────────────────────────────────────────────────────
 marked.use({ breaks: true, gfm: true });
@@ -178,25 +179,52 @@ restoreTranscript();
 fetchAgentCard().then(maybeAutoHello);
 resumeActiveTaskOnLoad();
 
-// Auth link: shown only when the host app configured login_url / logout_url
-// on build_a2a_ui(). The framework itself owns no auth — it just renders
-// the link the host points it at. Sign-out is preferred when both are set
-// (a sign-in is meaningless once authed); the host should configure only
-// the relevant one for the request, or leave both set and accept the
-// "sign-out always visible" behaviour.
-(function setupAuthLink() {
+// Auth link: rendered as "Sign in" or "Sign out" depending on the
+// authenticated state reported by ``auth_status_url`` (when the host
+// configured it). The framework owns no auth itself — it just probes
+// the endpoint and points the link at LOGIN_URL / LOGOUT_URL.
+//
+// When ``auth_status_url`` is NOT configured we conservatively default
+// to "Sign in" (if LOGIN_URL is set) so an unauthenticated visitor
+// isn't presented with a misleading "Sign out".
+function setAuthLink(authenticated) {
   const $authLink = document.getElementById('auth-link');
   if (!$authLink) return;
-  if (LOGOUT_URL) {
+  if (authenticated && LOGOUT_URL) {
     $authLink.textContent = 'Sign out';
     $authLink.href = LOGOUT_URL;
     $authLink.classList.remove('hidden');
-  } else if (LOGIN_URL) {
+  } else if (!authenticated && LOGIN_URL) {
     $authLink.textContent = 'Sign in';
     $authLink.href = LOGIN_URL;
     $authLink.classList.remove('hidden');
+  } else {
+    $authLink.classList.add('hidden');
   }
-})();
+}
+
+async function refreshAuthLink() {
+  if (!AUTH_STATUS_URL) {
+    // No probe endpoint — default to "Sign in" so users can get authed,
+    // never to "Sign out" when we can't confirm a session exists.
+    setAuthLink(false);
+    return;
+  }
+  try {
+    const resp = await fetch(AUTH_STATUS_URL, { credentials: 'same-origin' });
+    if (!resp.ok) {
+      setAuthLink(false);
+      return;
+    }
+    const data = await resp.json();
+    setAuthLink(Boolean(data?.authenticated));
+  } catch (err) {
+    console.warn('[a2a] auth-status probe failed:', err);
+    setAuthLink(false);
+  }
+}
+
+refreshAuthLink();
 
 // ── Auth (401) handling ──────────────────────────────────────────────────────
 // The framework owns no auth itself — but a host app may sit a 401 gate in
@@ -216,6 +244,9 @@ function throwIfUnauthorized(response) {
 }
 
 function renderSignInRequired() {
+  // Session has expired or never existed — make the header link reflect
+  // that immediately rather than waiting for the next probe.
+  setAuthLink(false);
   // One bubble explaining the gate + a sign-in CTA when the host
   // supplied login_url. We don't auto-redirect — that would clobber
   // any user state on the page (typed input, scroll position).
