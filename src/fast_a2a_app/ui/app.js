@@ -175,8 +175,41 @@ if (!FILE_UPLOAD_API) {
   // still validates server-side — this is just UX hygiene.
   $fileInput.accept = ACCEPTED_FILE_TYPES;
 }
+// Identity-transition handshake: when the host redirects ``/auth/callback``
+// (sign-in success) OR ``/auth/signout`` to ``/?fresh_chat=1`` the chat UI
+// treats it as the start of a new session — wipe any stale browser-side
+// chat state from a previous identity, strip the marker from the URL, and
+// force an explicit ``/hello`` after the agent card loads (bypassing
+// ``maybeAutoHello``, which only fires for genuinely fresh-cold contexts).
+//
+// Same handshake for both transitions because the desired surface is the
+// same — a fresh chat with the agent's welcome already showing. After
+// sign-OUT the welcome /hello will hit a 401 (cookie just cleared) and
+// the UI swaps it for the "sign-in required" panel; after sign-IN the
+// /hello succeeds and renders the overview.
+const freshChat = (function detectFreshChat() {
+  let url;
+  try { url = new URL(window.location.href); }
+  catch (_) { return false; }
+  if (url.searchParams.get('fresh_chat') !== '1') return false;
+  resetBrowserChatState();
+  url.searchParams.delete('fresh_chat');
+  const clean = url.pathname + (url.search ? url.search : '') + url.hash;
+  window.history.replaceState({}, '', clean);
+  return true;
+})();
+
 restoreTranscript();
-fetchAgentCard().then(maybeAutoHello);
+fetchAgentCard().then(() => {
+  if (freshChat) {
+    // We just crossed an identity boundary (sign-in or sign-out) — auto-
+    // fire /hello regardless of the boot-time ``isFreshContext`` value.
+    // The reset above already gave us a fresh contextId + empty transcript.
+    sendSlashCommand('/hello').catch(() => {});
+    return;
+  }
+  return maybeAutoHello();
+});
 resumeActiveTaskOnLoad();
 
 // Auth link: rendered as "Sign in" or "Sign out" depending on the
@@ -208,7 +241,7 @@ function setAuthLink(authenticated) {
     // server-side session is dropped by the host's /auth/signout route.
     $fresh.addEventListener('click', (event) => {
       event.preventDefault();
-      resetChatStateForSignOut();
+      resetBrowserChatState();
       window.location.href = LOGOUT_URL;
     });
   } else if (!authenticated && LOGIN_URL) {
@@ -220,14 +253,14 @@ function setAuthLink(authenticated) {
   }
 }
 
-function resetChatStateForSignOut() {
+function resetBrowserChatState() {
   // Stronger than the "+ New chat" reset: that one only forgets the
   // *current* transcript and leaks earlier ones (the transcript key is
-  // ``a2a_transcript:<cid>`` — see transcriptStorageKey). On sign-out
-  // we sweep EVERY a2a_transcript:* entry so nothing from the prior
-  // identity persists across the next sign-in. No automatic /hello
-  // afterwards — we're about to redirect to LOGOUT_URL, any send would
-  // race with the navigation.
+  // ``a2a_transcript:<cid>`` — see transcriptStorageKey). Here we sweep
+  // EVERY a2a_transcript:* entry so nothing from a prior identity
+  // persists across the next sign-in. Used by:
+  //   * the Sign-out click handler (followed by navigation to LOGOUT_URL)
+  //   * the just-signed-in boot path (followed by an explicit /hello)
   try {
     clearTranscript();
     clearActiveTask();
