@@ -515,12 +515,17 @@
     }
 
     // ── Bootstrap ────────────────────────────────────────────────────
-    // Build the panel as soon as ``document.body`` exists. We don't
-    // wait for DOMContentLoaded because the framework's
-    // ``restoreTranscript()`` runs synchronously when ``app.js``
-    // executes (defer) and may invoke this renderer first.
+    // Wire the resize / mutation listeners up front so the alignment
+    // helper is armed as soon as a panel comes into existence — but DO
+    // NOT create the panel here. The panel is built lazily on the first
+    // ``DOCUMENTS`` artifact emission (see the renderer below); agents
+    // that never emit one (e.g. the bi-weekly-status agent) never get
+    // a "Workspace" side panel docked on their UI.
+    //
+    // ``alignToChat`` and the listeners are safe to register against an
+    // absent panel — both early-out on ``!panelEl`` and start updating
+    // its position only once ``ensurePanel()`` finally runs.
     const bootstrap = () => {
-        ensurePanel();
         wireAlignment();
     };
     if (document.body) {
