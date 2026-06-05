@@ -136,6 +136,16 @@ Your workflow:
    destinations that match their preferences, with pros and cons for each.
    The tool also drops a map onto the chat with a pin for each suggestion, so
    refer to "the map above" in your reply rather than re-listing coordinates.
+
+   CRITICAL: ``recommend_destinations`` runs a fresh LLM call that does NOT
+   see this conversation. The ``context_notes`` argument is the ONLY channel
+   for carrying over what the user has said. Before calling the tool, scan
+   the conversation history and pack into ``context_notes`` every constraint
+   the user has stated: region they named ("somewhere in Italy", "in Europe",
+   "near Munich"), must-haves ("kid-friendly", "no flights"), dealbreakers
+   ("not too touristy", "avoided X last time"), past trips, travel-style
+   hints. If you skip this, the recommendations will be globally generic
+   and ignore the user's actual brief.
 3. When the user picks a destination, use create_itinerary to build a
    day-by-day plan tailored to their interests and duration.
 4. Use estimate_budget to give them a realistic cost breakdown.
@@ -231,6 +241,7 @@ async def recommend_destinations(
     duration_days: int,
     budget_level: str,
     travel_month: str,
+    context_notes: str,
 ) -> str:
     """Generate 2-3 tailored destination recommendations.
 
@@ -243,18 +254,38 @@ async def recommend_destinations(
         duration_days: Total trip length in days
         budget_level: 'budget', 'moderate', or 'luxury'
         travel_month: Month of travel (e.g. 'July', 'December')
+        context_notes: A 2-4 sentence summary of EVERYTHING the user has
+            said so far that constrains the recommendation — region they
+            named ("somewhere in Italy", "near home in Munich"), must-haves
+            ("kid-friendly", "no flying"), dealbreakers ("not too touristy"),
+            past trips they don't want to repeat, travel-style hints, etc.
+            Pass an empty string ONLY if this is the user's first turn and
+            no constraints have been stated yet. This is the only way the
+            inner generator sees the conversation — without it the
+            recommendations will drift away from what the user asked for.
     """
     report_progress(
         f"Finding destinations for {duration_days}-day {budget_level} trip in {travel_month}…",
     )
 
-    prompt = f"""Generate exactly 2-3 holiday destination recommendations as a JSON array.
+    context_block = (
+        f"Prior conversation context (must be respected — these are constraints "
+        f"the user has already stated):\n{context_notes.strip()}\n\n"
+        if context_notes and context_notes.strip()
+        else ""
+    )
+    prompt = f"""{context_block}Generate exactly 2-3 holiday destination recommendations as a JSON array.
 
-Context:
+Parameters:
 - Interests: {interests}
 - Duration: {duration_days} days
 - Budget level: {budget_level}
 - Travel month: {travel_month}
+
+Every recommendation MUST be consistent with the prior conversation context
+above. If the user named a region or country, every pick must be inside it.
+If they ruled something out, do not include it. Do not invent constraints
+the user did not state.
 
 For each destination return:
 {{
