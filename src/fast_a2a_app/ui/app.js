@@ -190,16 +190,67 @@ resumeActiveTaskOnLoad();
 function setAuthLink(authenticated) {
   const $authLink = document.getElementById('auth-link');
   if (!$authLink) return;
+  // Replace the node so we drop any prior click handler before re-attaching;
+  // simple .onclick reassignment would also work, but cloneNode avoids any
+  // leaked listener registered via addEventListener in older builds.
+  const $fresh = $authLink.cloneNode(true);
+  $authLink.parentNode.replaceChild($fresh, $authLink);
+
   if (authenticated && LOGOUT_URL) {
-    $authLink.textContent = 'Sign out';
-    $authLink.href = LOGOUT_URL;
-    $authLink.classList.remove('hidden');
+    $fresh.textContent = 'Sign out';
+    $fresh.href = LOGOUT_URL;
+    $fresh.classList.remove('hidden');
+    // Sign-out hard-resets the browser-side chat: a new context id, no
+    // transcript, no pending uploads, no resumable task. Otherwise the
+    // next user on this browser (or the same user signing back in)
+    // would see the previous person's conversation. We clear FIRST
+    // and only navigate to LOGOUT_URL once cleanup completed — the
+    // server-side session is dropped by the host's /auth/signout route.
+    $fresh.addEventListener('click', (event) => {
+      event.preventDefault();
+      resetChatStateForSignOut();
+      window.location.href = LOGOUT_URL;
+    });
   } else if (!authenticated && LOGIN_URL) {
-    $authLink.textContent = 'Sign in';
-    $authLink.href = LOGIN_URL;
-    $authLink.classList.remove('hidden');
+    $fresh.textContent = 'Sign in';
+    $fresh.href = LOGIN_URL;
+    $fresh.classList.remove('hidden');
   } else {
-    $authLink.classList.add('hidden');
+    $fresh.classList.add('hidden');
+  }
+}
+
+function resetChatStateForSignOut() {
+  // Stronger than the "+ New chat" reset: that one only forgets the
+  // *current* transcript and leaks earlier ones (the transcript key is
+  // ``a2a_transcript:<cid>`` — see transcriptStorageKey). On sign-out
+  // we sweep EVERY a2a_transcript:* entry so nothing from the prior
+  // identity persists across the next sign-in. No automatic /hello
+  // afterwards — we're about to redirect to LOGOUT_URL, any send would
+  // race with the navigation.
+  try {
+    clearTranscript();
+    clearActiveTask();
+    clearPendingFiles();
+    fullscreenImages = [];
+    fullscreenIndex = -1;
+    suggestionsByTaskId.clear();
+    if (fullscreenOpen) closeFullscreen();
+
+    // Sweep orphaned transcripts from earlier "+ New chat" sessions.
+    const orphans = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(`${TRANSCRIPT_KEY}:`)) orphans.push(key);
+    }
+    orphans.forEach((key) => localStorage.removeItem(key));
+
+    // Fresh context id LAST, after the per-cid transcript above is gone,
+    // so the next sign-in lands on a brand-new conversation.
+    contextId = genUUID();
+    persist(contextId);
+  } catch (err) {
+    console.warn('[a2a] sign-out reset failed; proceeding to redirect:', err);
   }
 }
 
