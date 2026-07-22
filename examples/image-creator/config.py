@@ -32,6 +32,21 @@ AZURE_AI_DEPLOYMENT_NAME = (
     os.environ.get("AZURE_AI_DEPLOYMENT_NAME", "").strip() or "gpt-5.4-mini"
 )
 
+# ── Google Vertex AI (Gemini image) ───────────────────────────────────────────
+# Alternative image backend. Auth is via managed identity / Application Default
+# Credentials (``google.auth.default()``) — Workload Identity in a cluster,
+# ``gcloud auth application-default login`` locally. No API keys.
+#
+# The Gemini image *model id* (``gemini-3.1-flash-image-preview`` /
+# ``gemini-2.5-flash-image``, both of which support editing) is selected
+# per-conversation via ``/set model`` (see ``CONFIG_PARAMETERS`` in
+# ``agent.py``). ``GCP_LOCATION`` is the Vertex AI region the image client is
+# pinned to.
+
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "hmcp-dev-dxtinsnd-de-prj-a04").strip()
+#GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1").strip()
+GCP_LOCATION = os.getenv("GCP_LOCATION", "global").strip()
+
 # ── Uploads ───────────────────────────────────────────────────────────────────
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024   # 10 MB cap per upload

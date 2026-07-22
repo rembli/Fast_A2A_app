@@ -37,6 +37,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from a2a.server.agent_execution import RequestContext
 from a2a.types import (
@@ -49,6 +50,10 @@ from a2a.types import (
     Role,
 )
 from azure.identity.aio import AzureCliCredential, get_bearer_token_provider
+from google import genai
+from google.genai import types as genai_types
+import google.auth
+import google.auth.exceptions
 from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
@@ -65,6 +70,8 @@ from config import (
     APP_BASE_URL,
     AZURE_AI_BASE_URL,
     AZURE_AI_DEPLOYMENT_NAME,
+    GCP_LOCATION,
+    GCP_PROJECT_ID,
 )
 from fast_a2a_app import (
     image_artifact,
@@ -145,6 +152,8 @@ CONFIG_PARAMETERS: dict[str, dict] = {
         "values": {
             "gpt-image-1-mini": "Faster, lower-cost OpenAI image model.",
             "gpt-image-1": "Higher fidelity, slower OpenAI image model.",
+            "gemini-3.1-flash-image-preview": "Google Gemini 3.1 Flash Image (Nano Banana 2, preview) — latest, supports editing.",
+            "gemini-2.5-flash-image": "Google Gemini 2.5 Flash Image (Nano Banana) — fast, supports editing.",
         },
     },
     "size": {
@@ -181,6 +190,72 @@ _chat_model = OpenAIModel(
     AZURE_AI_DEPLOYMENT_NAME,
     provider=OpenAIProvider(openai_client=_openai_client),
 )
+
+
+# ── Google Vertex AI (Gemini image) client ────────────────────────────────────
+# Alternative image backend, selected per-conversation via ``/set model
+# gemini-3-pro-image`` or ``/set model gemini-3.1-flash-image``. Both are Gemini
+# native image models ("Nano Banana") that support text-to-image *and* image
+# editing (text-and-image-to-image). Authentication is fully delegated to
+# ``google.auth.default()`` — Workload Identity / managed identity in a
+# cluster, ``gcloud auth application-default login`` locally. No API keys.
+#
+# Both singletons are lazily built and cached so a deployment that never uses a
+# Gemini image model pays no auth/discovery cost at import time.
+
+
+def _is_gemini_image_model(model: str) -> bool:
+    """Route to the Google backend for Gemini native image model ids."""
+    lowered = model.lower()
+    return lowered.startswith("gemini") and "image" in lowered
+
+
+@lru_cache(maxsize=1)
+def _google_credentials() -> "google.auth.credentials.Credentials":
+    """Resolve Application Default Credentials once and reuse (the credential
+    object refreshes its own token). Fails loudly at first use — rather than
+    deep inside a Vertex request — when discovery fails (missing Workload
+    Identity / metadata server, no local ADC, etc.).
+    """
+    try:
+        creds, detected_project = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+    except google.auth.exceptions.DefaultCredentialsError:
+        log.error(
+            "Google ADC discovery failed. Run "
+            "`gcloud auth application-default login` locally, or ensure "
+            "Workload Identity / managed identity is configured in the cluster.",
+        )
+        raise
+    log.info(
+        "Google ADC resolved: creds_type=%s detected_project=%s",
+        type(creds).__name__, detected_project,
+    )
+    return creds
+
+
+@lru_cache(maxsize=1)
+def _image_client() -> "genai.Client":
+    """Lazily-built, cached google-genai client pinned to the Vertex AI image
+    region. Shares managed-identity ADC credentials with the rest of the app.
+    """
+    return genai.Client(
+        vertexai=True,
+        project=GCP_PROJECT_ID or None,
+        location=GCP_LOCATION,
+        credentials=_google_credentials(),
+    )
+
+
+# Maps the app's pixel-size config to the Gemini image aspect-ratio vocabulary
+# (Gemini image models take an ``aspect_ratio``, not explicit pixel
+# dimensions). Unknown sizes fall back to a square 1:1.
+_SIZE_TO_ASPECT_RATIO: dict[str, str] = {
+    "1024x1024": "1:1",
+    "1024x1536": "3:4",
+    "1536x1024": "4:3",
+}
 
 
 # ── Pydantic-ai agent ─────────────────────────────────────────────────────────
@@ -496,12 +571,19 @@ async def brand_asset_lookup(ctx: RunContext[AgentDeps], asset_name: str) -> str
 async def _generate_pixels(
     model: str, prompt: str, references: list[tuple[bytes, str]], size: str,
 ) -> tuple[bytes | None, str]:
-    """Call the OpenAI image API. Direct SDK call — same shape as before.
+    """Call the configured image API and return ``(bytes, mime)``.
 
-    Kept separate from :func:`generate_image` so the orchestration concerns
-    (progress reporting, deps, artifact stashing, error formatting for the
-    chat model) all live in one place — this layer just produces pixels.
+    Routes to the Google Gemini image backend on Vertex AI when *model* is a
+    Gemini native image model id (``gemini-*-image``), otherwise to the Azure
+    OpenAI images API. Both backends support text-to-image and image editing
+    (when a reference is supplied). Kept separate from :func:`generate_image`
+    so the orchestration concerns (progress reporting, deps, artifact
+    stashing, error formatting for the chat model) all live in one place —
+    this layer just produces pixels.
     """
+    if _is_gemini_image_model(model):
+        return await _generate_pixels_gemini(model, prompt, references, size)
+
     if references:
         files: list[io.BytesIO] = []
         for i, (data, mime) in enumerate(references):
@@ -527,6 +609,50 @@ async def _generate_pixels(
     if not b64:
         return None, "image/png"
     return base64.b64decode(b64), "image/png"
+
+
+# Gemini native image models (``gemini-3.1-flash-image-preview`` /
+# ``gemini-2.5-flash-image``) do both text-to-image and image editing via
+# ``generate_content``: the text prompt plus any reference images are passed
+# as content parts, and the model returns the result as an inline-data image
+# part. The blocking google-genai SDK call is offloaded to a thread so it
+# doesn't stall the event loop.
+async def _generate_pixels_gemini(
+    model: str, prompt: str, references: list[tuple[bytes, str]], size: str,
+) -> tuple[bytes | None, str]:
+    """Text-to-image or image editing via a Gemini image model on Vertex AI,
+    authenticated with managed-identity ADC."""
+    aspect_ratio = _SIZE_TO_ASPECT_RATIO.get(size, "1:1")
+
+    parts: list[genai_types.Part] = [genai_types.Part.from_text(text=prompt)]
+    for data, mime in references:
+        parts.append(genai_types.Part.from_bytes(data=data, mime_type=mime))
+
+    def _call() -> object:
+        return _image_client().models.generate_content(
+            model=model,
+            contents=parts,
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=genai_types.ImageConfig(aspect_ratio=aspect_ratio),
+            ),
+        )
+
+    response = await asyncio.to_thread(_call)
+
+    # Gemini image models (esp. the Pro "thinking" variant) may emit several
+    # inline-image parts — intermediate "thought" images followed by the final
+    # render. Keep the last one, which is the finished image.
+    image_bytes: bytes | None = None
+    mime = "image/png"
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                image_bytes = inline.data
+                mime = getattr(inline, "mime_type", None) or "image/png"
+    return image_bytes, mime
 
 
 def _ext_for_mime(mime: str) -> str:
