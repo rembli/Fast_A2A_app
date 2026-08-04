@@ -31,7 +31,16 @@ const CID_STORAGE_KEY  = 'a2a_context_id';
 const ACTIVE_TASK_KEY  = 'a2a_active_task';
 const TRANSCRIPT_KEY   = 'a2a_transcript';
 const STREAM_MODE_KEY  = 'a2a_stream_mode';
-const STREAM_TIMEOUT   = 300000; // ms max wait (5 min)
+// Max *idle* gap between stream events, not a total wall-clock cap. The
+// timer is re-armed on every SSE payload received (see armIdleTimeout in
+// the send + resubscribe paths), so a long turn that keeps emitting
+// progress heartbeats never trips it — only a genuinely silent /
+// half-dead connection does. Agents that do minutes of work MUST emit a
+// progress event more often than this (office-agent's heartbeat ticks
+// every ~3s). Was a fixed 5-min deadline that aborted mid-run even while
+// the server was actively streaming — the classic "Timed out waiting for
+// streamed agent response" on long document builds.
+const STREAM_TIMEOUT   = 90000; // ms max SILENT gap between events (90s)
 const A2A_HEADERS      = { 'Content-Type': 'application/json', 'A2A-Version': '1.0' };
 
 // Server-injected runtime config (see fast_a2a_app/ui/route.py). Falsy /
@@ -522,7 +531,14 @@ async function sendAndStream(parts, thinkEl) {
   logWire('out', sendBody.method, sendBody);
 
   streamController = new AbortController();
-  const timeoutId = setTimeout(() => streamController.abort(), STREAM_TIMEOUT);
+  // Idle watchdog: re-armed on every received event so it only fires
+  // after STREAM_TIMEOUT of *silence*, not a fixed total deadline.
+  let timeoutId;
+  const armIdleTimeout = () => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => streamController.abort(), STREAM_TIMEOUT);
+  };
+  armIdleTimeout();
 
   const sendResp = await fetch(A2A_URL, {
     method: 'POST',
@@ -537,6 +553,7 @@ async function sendAndStream(parts, thinkEl) {
     if (!sendResp.body) throw new Error('Streaming response body missing.');
 
     await consumeSseResponse(sendResp.body, payload => {
+      armIdleTimeout();  // reset idle deadline on every event (heartbeats included)
       processStreamPayload(payload, streamState, thinkEl);
     });
 
@@ -857,7 +874,13 @@ async function resubscribeTaskStream(streamState, thinkEl, options = {}) {
   logWire('out', resumeBody.method, resumeBody);
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), STREAM_TIMEOUT);
+  // Idle watchdog: re-armed on every received event (see send path).
+  let timeoutId;
+  const armIdleTimeout = () => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => controller.abort(), STREAM_TIMEOUT);
+  };
+  armIdleTimeout();
 
   try {
     const response = await fetch(A2A_URL, {
@@ -880,6 +903,7 @@ async function resubscribeTaskStream(streamState, thinkEl, options = {}) {
     }
 
     await consumeSseResponse(response.body, payload => {
+      armIdleTimeout();  // reset idle deadline on every event
       processStreamPayload(payload, streamState, thinkEl);
     });
 
