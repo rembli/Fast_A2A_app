@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.1
+
+### Changed
+
+- **Docs: README documents the 0.8.0 feature set** — OIDC / Microsoft
+  Entra sign-in, pluggable persistence (including `SqliteTaskStore`), and
+  the new `secure-agent` example.
+- **Tooling: standardized on Poetry** — `poetry.lock` is now the single
+  source of truth and `uv.lock` was removed. (`uv.lock` had drifted ahead
+  of `poetry.lock`, breaking `poetry install`.)
+
+### Fixed
+
+- **`examples/.env.example`: corrected the misleading Redis note.** No
+  example requires Redis — `holiday-planner` and `image-creator` fall back
+  to `MemoryTaskStore` when `REDIS_URL` is unset. The template no longer
+  claims Redis is required, and `REDIS_URL` is commented out by default so
+  copying it to `.env` doesn't force a connection to a Redis that isn't
+  running.
+
 ## 0.8.0
 
 ### Added
