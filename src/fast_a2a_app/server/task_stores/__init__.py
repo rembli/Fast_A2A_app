@@ -15,6 +15,11 @@ One module per backend:
   using ``motor`` and TTL indexes.
 * :mod:`fast_a2a_app.server.task_stores.postgres` — Postgres-backed store
   using ``asyncpg`` and ``expires_at`` columns.
+* :mod:`fast_a2a_app.server.task_stores.sqlite`   — SQLite-backed store
+  using ``aiosqlite`` and a single on-disk file. Persists across restarts
+  with no external service, but single-process only (single writer,
+  in-process progress tail). Ideal for a small internal agent on a
+  mounted volume.
 
 Every backend implements the :class:`A2ATaskStore` Protocol below; pass any
 instance to ``build_a2a_app(task_store=...)``.
@@ -31,6 +36,7 @@ from .memory import MemoryTaskStore
 from .mongo import MongoTaskStore
 from .postgres import PostgresTaskStore
 from .redis import RedisTaskStore
+from .sqlite import SqliteTaskStore
 
 
 class A2ATaskStore(Protocol):
@@ -154,4 +160,5 @@ __all__ = [
     "PostgresTaskStore",
     "ProgressEntry",
     "RedisTaskStore",
+    "SqliteTaskStore",
 ]

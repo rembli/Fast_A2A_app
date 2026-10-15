@@ -31,6 +31,7 @@ from .task_stores import (
     MongoTaskStore,
     PostgresTaskStore,
     RedisTaskStore,
+    SqliteTaskStore,
 )
 from .utils import report_progress
 
@@ -70,5 +71,6 @@ __all__ = [
     "MongoTaskStore",
     "PostgresTaskStore",
     "RedisTaskStore",
+    "SqliteTaskStore",
     "report_progress",
 ]

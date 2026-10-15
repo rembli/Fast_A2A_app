@@ -71,6 +71,7 @@ from .server import (
     MongoTaskStore,
     PostgresTaskStore,
     RedisTaskStore,
+    SqliteTaskStore,
     artifact_types,
     bind_executor,
     build_a2a_app,
@@ -92,6 +93,7 @@ from .server import (
     text_artifact,
 )
 from .ui import a2a_ui, build_a2a_ui
+from .auth import OIDCSettings, auth_ui_kwargs, install_auth
 
 __all__ = [
     # Server
@@ -126,10 +128,15 @@ __all__ = [
     "MongoTaskStore",
     "PostgresTaskStore",
     "RedisTaskStore",
+    "SqliteTaskStore",
     "report_progress",
     # UI
     "a2a_ui",
     "build_a2a_ui",
+    # Auth (generic OIDC; Microsoft Entra ID by default)
+    "install_auth",
+    "auth_ui_kwargs",
+    "OIDCSettings",
     # Meta
     "__version__",
 ]

@@ -1,8 +1,36 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 ### Added
+
+- **`SqliteTaskStore` — single-file persistent task store.** A new
+  [`fast_a2a_app.SqliteTaskStore`](src/fast_a2a_app/server/task_stores/sqlite.py)
+  backend (via `aiosqlite`) persists tasks, the context index, cancel
+  signals, and the replayable progress log to one on-disk file, so task
+  state survives a restart with no external database. Build it with
+  `await SqliteTaskStore.from_path("/data/tasks.db")` and pass it to
+  `build_a2a_app(task_store=...)`. Single-process only (single writer,
+  in-process progress tail) — use Redis/Postgres for a horizontally
+  scaled fleet. Implements the full `A2ATaskStore` protocol, so the
+  crash-recovery sweeper (`clean_up_stale_tasks`) works against it.
+- **Generic OpenID Connect sign-in (`fast_a2a_app.auth`).** A drop-in
+  login layer that secures the whole app (A2A server, chat UI, and your
+  own routes) behind any OIDC provider — **Microsoft Entra ID by
+  default**, plus Google / Okta / Keycloak / Auth0, etc. Standard
+  authorization-code flow via `authlib` with provider discovery; **no
+  MSAL, no provider SDKs**. One call: `install_auth(app)`. Configure via
+  `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET` / `ENTRA_TENANT_ID` (Entra)
+  or `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_ISSUER` (generic).
+  Auth stays off locally when no credentials are present. Ships a
+  pure-ASGI login gate (SSE-safe) and `/auth/*` + `/api/me` routes;
+  `auth_ui_kwargs()` wires the UI in one line.
+- **Signed-in user's name in the chat UI header.** `build_a2a_ui` gains
+  a `user_info_url` parameter; when set, the UI fetches it on boot and
+  renders the user's name natively in the header, just left of the
+  Sign-out link. `fast_a2a_app.auth` serves it at `/api/me`.
+
+### Added (examples)
 
 - **Configurable agent parameters via `/set` (image-creator example)** —
   a generalisable pattern for runtime-switchable agent knobs without

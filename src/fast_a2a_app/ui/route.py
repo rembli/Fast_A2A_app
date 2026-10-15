@@ -99,6 +99,7 @@ def build_a2a_ui(
     login_url: str | None = None,
     logout_url: str | None = None,
     auth_status_url: str | None = None,
+    user_info_url: str | None = None,
 ) -> Starlette:
     """Build a chat UI Starlette app with the given configuration.
 
@@ -132,6 +133,14 @@ def build_a2a_ui(
             to showing "Sign in" (if ``login_url`` is configured) so
             unauthenticated users aren't presented with a misleading
             "Sign out".
+        user_info_url: Optional read-only endpoint the chat UI fetches on
+            boot to show the signed-in user's name in the header, just
+            left of the Sign-out link. It must respond ``200`` with JSON
+            ``{"user": {"name": str, "email": str}}`` (``user`` may be
+            ``null`` when nobody is signed in). ``fast_a2a_app.auth``
+            exposes this at ``/api/me``; pass it via
+            :func:`fast_a2a_app.auth.auth_ui_kwargs`. Without it no name
+            badge is shown.
     """
     config = {
         "fileUploadApi": file_upload_api,
@@ -139,6 +148,7 @@ def build_a2a_ui(
         "loginUrl": (login_url or "").strip() or None,
         "logoutUrl": (logout_url or "").strip() or None,
         "authStatusUrl": (auth_status_url or "").strip() or None,
+        "userInfoUrl": (user_info_url or "").strip() or None,
         "libraryVersion": _LIBRARY_VERSION,
     }
     config_js = f"window.UI_CONFIG = {json.dumps(config)};"

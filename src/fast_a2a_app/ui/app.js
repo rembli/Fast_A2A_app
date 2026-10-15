@@ -51,6 +51,7 @@ const ACCEPTED_FILE_TYPES = (UI_CONFIG.acceptedFileTypes || '').trim();
 const LOGIN_URL       = (UI_CONFIG.loginUrl       || '').trim() || null;
 const LOGOUT_URL      = (UI_CONFIG.logoutUrl      || '').trim() || null;
 const AUTH_STATUS_URL = (UI_CONFIG.authStatusUrl  || '').trim() || null;
+const USER_INFO_URL   = (UI_CONFIG.userInfoUrl    || '').trim() || null;
 
 // ── marked setup ─────────────────────────────────────────────────────────────
 marked.use({ breaks: true, gfm: true });
@@ -263,6 +264,38 @@ function wipeBrowserChatState() {
   }
 }
 
+// Show (or hide) the signed-in user's name in the header, just left of the
+// Sign-out link. The name is styled with the UI's own muted header classes so
+// it reads as native. Driven by ``user_info_url`` (see build_a2a_ui); when the
+// host doesn't configure it, or nobody is signed in, the badge stays hidden.
+function setUserName(user) {
+  const $el = document.getElementById('user-name');
+  if (!$el) return;
+  const name = user && (user.name || user.email);
+  if (name) {
+    $el.textContent = name;
+    $el.title = (user && user.email) || '';
+    $el.classList.remove('hidden');
+  } else {
+    $el.textContent = '';
+    $el.removeAttribute('title');
+    $el.classList.add('hidden');
+  }
+}
+
+async function refreshUserName() {
+  if (!USER_INFO_URL) return;
+  try {
+    const resp = await fetch(USER_INFO_URL, { credentials: 'same-origin' });
+    if (!resp.ok) { setUserName(null); return; }
+    const data = await resp.json();
+    setUserName(data && data.user);
+  } catch (err) {
+    console.warn('[a2a] user-info fetch failed:', err);
+    setUserName(null);
+  }
+}
+
 async function refreshAuthLink() {
   if (!AUTH_STATUS_URL) {
     // No probe endpoint — default to "Sign in" so users can get authed,
@@ -285,6 +318,7 @@ async function refreshAuthLink() {
 }
 
 refreshAuthLink();
+refreshUserName();
 
 // ── Auth (401) handling ──────────────────────────────────────────────────────
 // The framework owns no auth itself — but a host app may sit a 401 gate in
@@ -305,8 +339,10 @@ function throwIfUnauthorized(response) {
 
 function renderSignInRequired() {
   // Session has expired or never existed — make the header link reflect
-  // that immediately rather than waiting for the next probe.
+  // that immediately rather than waiting for the next probe, and drop any
+  // stale user-name badge.
   setAuthLink(false);
+  setUserName(null);
   // One bubble explaining the gate + a sign-in CTA when the host
   // supplied login_url. We don't auto-redirect — that would clobber
   // any user state on the page (typed input, scroll position).
