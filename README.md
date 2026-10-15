@@ -17,6 +17,8 @@ The [Agent2Agent (A2A) protocol](https://a2a-protocol.org/) is HTTP for AI agent
 - 💬 **Batteries-included chat UI.** Self-contained browser interface — no build step, no npm. Markdown, tables, maps, clickable suggestions, file uploads, image previews, fullscreen viewer.
 - 🧩 **Typed-artifact widgets you can extend.** Drop a `<TAG>.py` + `<TAG>.js` pair to add a new chat widget; built-ins ship `TABLE`, `PROMPT_SUGGESTIONS`, and `MAP` (Leaflet).
 - 📡 **Real protocol, not a mock.** Streaming SSE, multi-turn history, cross-instance cancel, reload recovery, agent-card discovery — built on `a2a-sdk` 1.0.x.
+- 🔐 **Optional sign-in, one call.** `install_auth(app)` gates the whole app behind OpenID Connect — Microsoft Entra ID by default, any provider via config, no MSAL. The chat UI shows the signed-in user's name. Off by default; on when you supply credentials.
+- 💾 **Pluggable persistence.** In-process `MemoryTaskStore` (default), single-file `SqliteTaskStore` (survives restarts, no server), or `Redis` / `Mongo` / `Postgres` for a horizontally scaled fleet.
 
 ---
 
@@ -84,7 +86,7 @@ export AZURE_AI_DEPLOYMENT_NAME=gpt-4o
 uvicorn main:app --reload
 ```
 
-No Docker needed for local development — the default in-process `MemoryTaskStore` keeps task state in RAM. For multi-process / cross-instance deployments, pass `task_store=RedisTaskStore.from_url(REDIS_URL)` (or a `MongoTaskStore` / `PostgresTaskStore`) to `build_a2a_app`.
+No Docker needed for local development — the default in-process `MemoryTaskStore` keeps task state in RAM. Want persistence across restarts without standing up a server? Pass `task_store=await SqliteTaskStore.from_path("tasks.db")` — one file, no infrastructure. For multi-process / cross-instance deployments, use `RedisTaskStore.from_url(REDIS_URL)` (or a `MongoTaskStore` / `PostgresTaskStore`) instead.
 
 Open <http://localhost:8000/> — you're chatting.
 
@@ -113,11 +115,12 @@ A **Debug** tab in the chat UI surfaces full task state, JSON-RPC request/respon
 | [Joke Agent](examples/joke-agent/README.md) | Raw chat completions, no agent framework | Azure OpenAI |
 | [Image Creator](examples/image-creator/README.md) | Multi-tool agent: image generation, web search, fullscreen viewer, prompt suggestions, in-agent slash commands | Azure OpenAI |
 | [Holiday Planner](examples/holiday-planner/README.md) | Pydantic-ai agent with tools, live progress, **interactive map** of suggested destinations, artifact-aware quick-reply pills (click a destination to advance) | Azure OpenAI |
+| [Secure Agent](examples/secure-agent/README.md) | Pydantic-ai agent behind **OIDC / Microsoft Entra sign-in** with a persistent **SQLite task store** and the signed-in user's name in the UI | Azure OpenAI |
 
 
 Every example follows the same two-file layout: `agent.py` owns the `agent_card`, `invoke` / `stream_invoke`, and any tools or prompts; `main.py` is a thin FastAPI composition root that imports them and calls `build_a2a_app`. Keeping the AgentCard next to the agent functions means the agent's metadata, skills, and behaviour live together.
 
-The first three examples (Echo Agent, Echo Multipart, Joke Agent) run on the in-process `MemoryTaskStore` and need no external service. The remaining examples opt into Redis when `REDIS_URL` is set in the environment (and fall back to memory otherwise).
+The first three examples (Echo Agent, Echo Multipart, Joke Agent) run on the in-process `MemoryTaskStore` and need no external service. Image Creator and Holiday Planner opt into Redis when `REDIS_URL` is set (and fall back to memory otherwise). Secure Agent uses the single-file `SqliteTaskStore` and adds optional OIDC / Microsoft Entra sign-in — set the `ENTRA_*` (or `OIDC_*`) vars to turn the login gate on, or leave them unset to run open.
 
 ### Running an example with Poetry
 
