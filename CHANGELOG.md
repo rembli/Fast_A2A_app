@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.1
+
+### Added
+
+- **Bearer challenge on 401 (service-to-service discovery).** When bearer
+  acceptance is enabled (`A2A_BEARER_AUDIENCE` set, see 0.9.0), the auth gate
+  now returns an RFC 6750 `WWW-Authenticate: Bearer` header on the `401` it
+  sends to unauthenticated API requests. The challenge advertises the
+  `resource` (the audience a token must carry), a ready-to-use
+  `scope` (`<audience>/.default`), and the `authorization_uri` (the OIDC
+  discovery document). A calling backend can read this, mint a token for the
+  advertised audience, and retry — so an operator no longer has to pre-share
+  the agent's audience out of band to wire up a service-to-service caller.
+  No challenge is sent when bearer acceptance is off (behaviour unchanged).
+
 ## 0.8.1
 
 ### Changed

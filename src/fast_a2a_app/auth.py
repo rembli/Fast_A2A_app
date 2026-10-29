@@ -266,6 +266,10 @@ class RequireAuthMiddleware:
         self._public_paths = settings.public_paths
         self._api_prefixes = settings.api_prefixes
         self._bearer = bearer
+        # Advertised on the 401 challenge so a service-to-service caller can
+        # discover which audience to mint a token for (see _challenge_headers).
+        self._bearer_audience = settings.bearer_audience
+        self._discovery_url = settings.discovery_url
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -290,10 +294,30 @@ class RequireAuthMiddleware:
                 await self.app(scope, receive, send)
                 return
         if is_api:
-            response: Response = Response(status_code=401)
+            response: Response = Response(status_code=401, headers=self._challenge_headers())
         else:
             response = RedirectResponse("/auth/login")
         await response(scope, receive, send)
+
+    def _challenge_headers(self) -> dict:
+        """RFC 6750 ``WWW-Authenticate`` challenge for a rejected API request.
+
+        When bearer acceptance is on, advertise the ``resource`` (the audience a
+        token must carry) and a ready-to-use ``scope`` (``<audience>/.default``),
+        plus the ``authorization_uri`` (the OIDC discovery document). A
+        service-to-service client can then mint the right token and retry without
+        the operator pre-sharing the audience out of band. Absent a configured
+        bearer audience there's nothing to mint for, so no challenge is sent.
+        """
+        if not (self._bearer is not None and self._bearer_audience):
+            return {}
+        parts = [
+            f'resource="{self._bearer_audience}"',
+            f'scope="{self._bearer_audience}/.default"',
+        ]
+        if self._discovery_url:
+            parts.append(f'authorization_uri="{self._discovery_url}"')
+        return {"WWW-Authenticate": "Bearer " + ", ".join(parts)}
 
 
 def _bearer_token(scope) -> str:
