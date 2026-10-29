@@ -112,6 +112,12 @@ class OIDCSettings:
     session_secret: str | None = None
     public_paths: frozenset[str] = field(default_factory=lambda: frozenset(_DEFAULT_PUBLIC_PATHS))
     api_prefixes: tuple[str, ...] = _DEFAULT_API_PREFIXES
+    # When set, the gate also accepts an Authorization: Bearer access token whose
+    # ``aud`` equals this value (verified against the provider JWKS/issuer), so
+    # service-to-service callers can authenticate without a browser session. The
+    # expected issuer is read from the discovery metadata unless overridden.
+    bearer_audience: str | None = None
+    bearer_issuer: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -158,6 +164,10 @@ class OIDCSettings:
             scopes=scopes or "openid profile email",
             redirect_uri=os.environ.get("OIDC_REDIRECT_URI", "").strip() or None,
             session_secret=os.environ.get("SESSION_SECRET", "").strip() or None,
+            bearer_audience=(os.environ.get("A2A_BEARER_AUDIENCE")
+                             or os.environ.get("OIDC_BEARER_AUDIENCE") or "").strip() or None,
+            bearer_issuer=(os.environ.get("A2A_BEARER_ISSUER")
+                           or os.environ.get("OIDC_BEARER_ISSUER") or "").strip() or None,
         )
 
 
@@ -245,12 +255,17 @@ class RequireAuthMiddleware:
     inner app with no response wrapping, so SSE on ``/a2a`` streams
     unimpeded. API prefixes get a bare ``401``; browser paths are redirected
     to ``/auth/login``.
+
+    When a :class:`BearerValidator` is configured, API-prefix requests that
+    carry a valid ``Authorization: Bearer`` access token are also admitted —
+    the service-to-service path, alongside the browser session cookie.
     """
 
-    def __init__(self, app, settings: OIDCSettings) -> None:
+    def __init__(self, app, settings: OIDCSettings, bearer=None) -> None:
         self.app = app
         self._public_paths = settings.public_paths
         self._api_prefixes = settings.api_prefixes
+        self._bearer = bearer
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -261,11 +276,35 @@ class RequireAuthMiddleware:
         if session.get("user") or path in self._public_paths:
             await self.app(scope, receive, send)
             return
-        if path.startswith(self._api_prefixes):
+        is_api = path.startswith(self._api_prefixes)
+        if is_api and self._bearer is not None:
+            claims = await self._bearer.validate(_bearer_token(scope))
+            if claims is not None:
+                # Expose the verified caller to the app the same shape a session
+                # does, so downstream handlers can read request.session["user"].
+                sess = scope.get("session")
+                if isinstance(sess, dict):
+                    sess.setdefault("user", {"sub": claims.get("sub"),
+                                             "email": claims.get("email") or claims.get("upn"),
+                                             "token": "bearer"})
+                await self.app(scope, receive, send)
+                return
+        if is_api:
             response: Response = Response(status_code=401)
         else:
             response = RedirectResponse("/auth/login")
         await response(scope, receive, send)
+
+
+def _bearer_token(scope) -> str:
+    """Extract the ``Authorization: Bearer`` token from an ASGI scope, or ``""``."""
+    for name, value in scope.get("headers") or []:
+        if name == b"authorization":
+            raw = value.decode("latin-1")
+            if raw[:7].lower() == "bearer ":
+                return raw[7:].strip()
+            return ""
+    return ""
 
 
 def install_auth(
@@ -322,7 +361,17 @@ def install_auth(
     # last-added middleware outermost — the session is populated first and the
     # gate can read it.
     if gate_on:
-        app.add_middleware(RequireAuthMiddleware, settings=settings)
+        bearer = None
+        if settings.enabled and settings.bearer_audience:
+            from ._bearer import BearerValidator
+
+            bearer = BearerValidator(
+                settings.discovery_url,
+                settings.bearer_audience,
+                issuer=settings.bearer_issuer,
+            )
+            log.info("install_auth: bearer-token acceptance ON (aud=%s)", settings.bearer_audience)
+        app.add_middleware(RequireAuthMiddleware, settings=settings, bearer=bearer)
 
     # Sign session cookies. In the cluster the stable, replica-shared client
     # secret keys the signature; locally a random per-process key is fine
