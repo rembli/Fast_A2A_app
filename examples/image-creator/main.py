@@ -83,9 +83,13 @@ async def get_config() -> dict:
     return CONFIG_PARAMETERS
 
 
-@app.get("/images/{image_id}", tags=["images"])
+# Image handlers. Wired to routes under the ``/a2a`` base further down
+# (``app.add_api_route("/a2a/images", …)``) rather than decorated here — since
+# fast_a2a_app 0.9.2 the chat UI posts uploads to ``/a2a/images`` and
+# ``image_store.url_for`` emits ``/a2a/images/<id>`` read URLs, so a single
+# ``/a2a`` origin serves the browser UI and service-to-service A2A callers alike.
 async def serve_image(image_id: str):
-    """Serve a stored image by id. URLs of the form ``/images/<id>`` are
+    """Serve a stored image by id. URLs of the form ``/a2a/images/<id>`` are
     produced by the agent (via ``image_store.url_for``) and embedded in
     URL-based image artifacts. The chat UI fetches them like any other
     static asset, so the wire transcript stays compact."""
@@ -100,7 +104,6 @@ async def serve_image(image_id: str):
     )
 
 
-@app.post("/images", tags=["images"])
 async def upload_image(file: UploadFile) -> dict:
     """Accept a user-uploaded image and return a URL the UI can use as a
     reference part. Pre-uploading on file-pick keeps base64 image bytes out
@@ -123,6 +126,17 @@ async def upload_image(file: UploadFile) -> dict:
         "filename": file.filename or f"upload-{image_id}",
     }
 
+
+# The image endpoints live under the ``/a2a`` base — the single origin shared by
+# the browser UI and service-to-service A2A callers. Since 0.9.2 the chat UI posts
+# uploads to ``/a2a`` + ``file_upload_api`` (here ``/a2a/images``), a
+# service-to-service A2A caller derives the same ``…/a2a`` base from the agent
+# card, and ``image_store.url_for`` emits ``/a2a/images/<id>`` read URLs served by
+# the ``GET`` below. Registered here (import time) **before** the ``/a2a`` mount
+# below so they resolve ahead of it; the mount is a catch-all sub-app that would
+# otherwise swallow ``/a2a/images``.
+app.add_api_route("/a2a/images", upload_image, methods=["POST"], tags=["images"])
+app.add_api_route("/a2a/images/{image_id}", serve_image, methods=["GET"], tags=["images"])
 
 # Use the default prompt builder with a small history window. The agent
 # receives ``prompt`` (= recent dialogue + current user input) and feeds it to

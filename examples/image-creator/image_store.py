@@ -22,7 +22,10 @@ import time
 from pathlib import Path
 
 DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24 h — matches the A2A task TTL
-URL_PREFIX = "/images/"
+# Served under the ``/a2a`` base so the chat UI and service-to-service A2A
+# callers share one origin (since fast_a2a_app 0.9.2). ``id_from_url`` still
+# matches on the ``/images/<id>`` substring, present in ``/a2a/images/<id>``.
+URL_PREFIX = "/a2a/images/"
 DEFAULT_BASE_DIR = Path(__file__).parent / "tmp"
 
 # Common image MIME types the chat UI emits.

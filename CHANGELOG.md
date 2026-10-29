@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.2
+
+### Changed
+
+- **The chat UI now posts uploads under the `/a2a` base.** The paperclip's
+  upload `POST` was previously sent to the app-configured `file_upload_api`
+  path verbatim (e.g. root `/uploads`), while the UI's JSON-RPC and agent-card
+  requests already targeted `/a2a`. The UI now resolves `file_upload_api`
+  under that same `/a2a` base, so `file_upload_api="/uploads"` uploads to
+  `/a2a/uploads`. This lets a single `/a2a` origin serve both the browser UI
+  and service-to-service A2A callers (which derive one base from the agent
+  card), so an app no longer has to also expose its upload endpoint at the
+  site root. Absolute URLs and paths already under `/a2a` pass through
+  unchanged (re-prefixing is idempotent).
+
+  **Migration (breaking for some apps):** an app must serve its upload
+  endpoint under `/a2a` — e.g. mirror `POST /uploads` at `POST /a2a/uploads`
+  (and the matching `GET`). Apps that already register the `/a2a`-prefixed
+  mirror (the common pattern for A2A-reachable uploads) need no change.
+
 ## 0.9.1
 
 ### Added

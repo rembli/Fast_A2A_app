@@ -46,7 +46,28 @@ const A2A_HEADERS      = { 'Content-Type': 'application/json', 'A2A-Version': '1
 // Server-injected runtime config (see fast_a2a_app/ui/route.py). Falsy /
 // missing values disable the corresponding feature.
 const UI_CONFIG = (typeof window !== 'undefined' && window.UI_CONFIG) || {};
-const FILE_UPLOAD_API = (UI_CONFIG.fileUploadApi || '').trim() || null;
+
+// Resolve the app-configured upload path under the A2A base ("/a2a").
+//
+// The chat UI is served at "/" but the A2A server — JSON-RPC (A2A_URL),
+// the agent card (CARD_URL), and the agent's companion upload endpoint —
+// is mounted under "/a2a". We post uploads to that same base so a single
+// "/a2a" origin serves the browser UI and service-to-service A2A callers
+// (which learn one base from the agent card) alike; an app no longer has
+// to also expose its upload endpoint at the site root.
+//
+// Absolute URLs ("https://…") and paths already under "/a2a" pass through
+// untouched, so re-prefixing is idempotent. ``file_upload_api="/uploads"``
+// therefore uploads to "/a2a/uploads".
+function resolveUploadApi(raw) {
+  const path = (raw || '').trim();
+  if (!path) return null;
+  if (/^https?:\/\//i.test(path)) return path;        // absolute URL — leave as-is
+  const base = A2A_URL.replace(/\/+$/, '');            // "/a2a/" → "/a2a"
+  if (path === base || path.startsWith(base + '/')) return path;  // already prefixed
+  return base + (path.startsWith('/') ? path : '/' + path);
+}
+const FILE_UPLOAD_API = resolveUploadApi(UI_CONFIG.fileUploadApi);
 const ACCEPTED_FILE_TYPES = (UI_CONFIG.acceptedFileTypes || '').trim();
 const LOGIN_URL       = (UI_CONFIG.loginUrl       || '').trim() || null;
 const LOGOUT_URL      = (UI_CONFIG.logoutUrl      || '').trim() || null;

@@ -6,7 +6,7 @@ A pydantic-ai agent that generates and iterates on images with Azure OpenAI's `g
 examples/image-creator/
 ├── agent.py          # pydantic-ai agent + tools + slash commands
 ├── image_store.py    # Filesystem-backed image storage (independent module)
-└── main.py           # FastAPI wiring + /images endpoints
+└── main.py           # FastAPI wiring + /a2a/images endpoints
 ```
 
 Dependencies are managed by the parent project's `pyproject.toml` — a single `poetry install` at the repo root covers every example.
@@ -18,8 +18,8 @@ Dependencies are managed by the parent project's `pyproject.toml` — a single `
 - **Multi-step plans** — *"generate three variations of this in different lighting"* — the agent calls `generate_image` repeatedly; each result streams into the chat as it lands.
 - **Conversation-aware orchestration** — A2A history is converted into pydantic-ai `ModelMessage`s and passed as `message_history` so the chat model carries forward style preferences and feedback (*"keep the warm palette"*, *"no people"*) across turns instead of starting from scratch every time.
 - **Prompt suggestions** — onboarding starters (after `/hello` / empty input), edit options (when an image is uploaded without text), and refinement options (after a successful generation) are emitted as `PROMPT_SUGGESTIONS` data parts and rendered as clickable buttons by the UI.
-- **URL-based image artifacts** — generated and uploaded images live in `image_store` (filesystem under `tmp/`); the agent ships only `/images/<id>` URLs over the wire. Transcripts stay compact and survive a refresh because the UI re-fetches via the sibling endpoint.
-- **Multi-part user input** — attach button in the UI uploads images via `POST /images` so even base64 data never enters `localStorage`.
+- **URL-based image artifacts** — generated and uploaded images live in `image_store` (filesystem under `tmp/`); the agent ships only `/a2a/images/<id>` URLs over the wire. Transcripts stay compact and survive a refresh because the UI re-fetches via the sibling endpoint.
+- **Multi-part user input** — attach button in the UI uploads images via `POST /a2a/images` so even base64 data never enters `localStorage`.
 - **Fullscreen image viewer** — click any image in the chat for a lightbox with prev/next navigation; the dedicated input there sends the currently-viewed image as a reference and stays open while the agent generates the next image (loader resumes on reopen if the user closed mid-turn).
 - **Slash commands** — `/hello`, `/help`, and the two-step `/set` wizard short-circuit the agent and return canned responses (no LLM call). Parsing is case-insensitive (`/SET`, `/Set`, `/set` all work); replies and pills always use lowercase. `/hello` is text-only — the starter prompts surface where they earn their keep (empty composer, image-without-text uploads, post-generation refinement) rather than pinning them to the welcome turn.
 - **Configurable parameters via `/set`** — `model`, `size`, and `style` are declared as a schema in `agent.CONFIG_PARAMETERS` (default + enum-like value map per parameter) and exposed verbatim at `GET /config`. The chat UI uses pills: `/set` lists parameters, `/set <param>` lists allowed values, `/set <param> <value>` confirms. A `cancel` pill is always offered.
@@ -106,6 +106,6 @@ Each:
 6. Awaits `image_agent.run(prompt, deps=deps, message_history=...)` — pydantic-ai loops through tool calls until the chat model is done.
 7. Streams each artifact stashed in `deps.generated` (one per `generate_image` call), then the agent's final text reply (bundled with refinement-suggestion buttons).
 
-`image_store.py` is an independent module — no dependency on `fast_a2a_app` or the UI. The `/images/{id}` GET endpoint and `/images` POST endpoint live in `main.py` and use the singleton store.
+`image_store.py` is an independent module — no dependency on `fast_a2a_app` or the UI. The `/a2a/images/{id}` GET endpoint and `/a2a/images` POST endpoint live in `main.py` and use the singleton store.
 
 The chat-model client (`AsyncOpenAI` + Azure CLI bearer-token provider) is shared between the orchestration agent and the in-tool LLM helpers (`expand_intent`, `rewrite_prompt`).
