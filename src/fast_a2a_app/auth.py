@@ -75,6 +75,7 @@ import os
 import secrets
 from dataclasses import dataclass, field
 
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from starlette.responses import RedirectResponse, Response
@@ -93,6 +94,10 @@ _DEFAULT_PUBLIC_PATHS = {
 # Non-browser surfaces answer unauthenticated requests with a bare 401 (rather
 # than an HTML login redirect a programmatic / SSE client can't follow).
 _DEFAULT_API_PREFIXES = ("/a2a", "/api/", "/uploads", "/sandbox")
+# The A2A agent card is a discovery document the spec serves unauthenticated at
+# ``<base>/.well-known/agent-card.json`` (suffix owned by the a2a-sdk). Matched
+# by suffix so it stays public regardless of the mount base (``/a2a`` or root).
+_AGENT_CARD_SUFFIX = AGENT_CARD_WELL_KNOWN_PATH
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,12 @@ class OIDCSettings:
     session_secret: str | None = None
     public_paths: frozenset[str] = field(default_factory=lambda: frozenset(_DEFAULT_PUBLIC_PATHS))
     api_prefixes: tuple[str, ...] = _DEFAULT_API_PREFIXES
+    # The A2A agent card is a discovery document; by spec it's served
+    # unauthenticated at ``<base>/.well-known/agent-card.json`` so anonymous
+    # clients can learn the agent before authenticating (the richer
+    # authenticated extended card stays behind the gate). Set False to gate the
+    # card behind the same login as the rest of the API (internal-only agents).
+    public_agent_card: bool = True
     # When set, the gate also accepts an Authorization: Bearer access token whose
     # ``aud`` equals this value (verified against the provider JWKS/issuer), so
     # service-to-service callers can authenticate without a browser session. The
@@ -265,6 +276,7 @@ class RequireAuthMiddleware:
         self.app = app
         self._public_paths = settings.public_paths
         self._api_prefixes = settings.api_prefixes
+        self._public_agent_card = settings.public_agent_card
         self._bearer = bearer
         # Advertised on the 401 challenge so a service-to-service caller can
         # discover which audience to mint a token for (see _challenge_headers).
@@ -278,6 +290,12 @@ class RequireAuthMiddleware:
         path = scope.get("path", "")
         session = scope.get("session") or {}
         if session.get("user") or path in self._public_paths:
+            await self.app(scope, receive, send)
+            return
+        # The A2A agent card is a public discovery document (spec convention):
+        # let anonymous callers fetch it so they can learn the agent before
+        # authenticating. Matched by suffix so any mount base works.
+        if self._public_agent_card and path.endswith(_AGENT_CARD_SUFFIX):
             await self.app(scope, receive, send)
             return
         is_api = path.startswith(self._api_prefixes)

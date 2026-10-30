@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.10.0
+
+### Changed
+
+- **The A2A agent card is now served unauthenticated by default.** The auth
+  gate previously treated `<base>/.well-known/agent-card.json` like any other
+  `/a2a` path, answering anonymous callers with `401`. Per the A2A convention
+  the public agent card is a discovery document — a client should be able to
+  learn an agent (its skills, endpoint, capabilities) *before* authenticating —
+  so the gate now admits anonymous requests for it. The path is matched by its
+  `/.well-known/agent-card.json` suffix (sourced from the a2a-sdk's
+  `AGENT_CARD_WELL_KNOWN_PATH`), so it stays public regardless of mount base
+  (`/a2a`, site root, …). The richer **authenticated extended card** is
+  unaffected and remains behind the gate.
+
+  New `OIDCSettings.public_agent_card: bool` (default `True`) controls this.
+
+  **Migration (behavior change):** deployments that relied on the agent card
+  being gated behind login must set `public_agent_card=False` to restore the
+  previous behavior. No change is needed to keep the new, spec-aligned default.
+
 ## 0.9.2
 
 ### Changed
