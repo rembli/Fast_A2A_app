@@ -49,6 +49,27 @@ def test_wrong_audience_rejected(keys):
     assert asyncio.run(_validator(jwks).validate(_token(key, aud="api://someone-else"))) is None
 
 
+def _validator_any_aud(jwks):
+    return BearerValidator(None, AUD, issuer=ISSUER, jwks=jwks, accept_any_audience=True)
+
+
+def test_accept_any_audience_ignores_aud(keys):
+    # Open/optional mode: a token minted for ANY audience is accepted (its profile
+    # is read) as long as signature + issuer + expiry are valid.
+    key, jwks = keys
+    claims = asyncio.run(_validator_any_aud(jwks).validate(_token(key, aud="api://some-other-app")))
+    assert claims and claims["sub"] == "user-1" and claims["email"] == "u@x"
+
+
+def test_accept_any_audience_still_enforces_issuer_expiry_signature(keys):
+    key, jwks = keys
+    v = _validator_any_aud(jwks)
+    assert asyncio.run(v.validate(_token(key, iss="https://evil/v2.0"))) is None   # wrong issuer
+    assert asyncio.run(v.validate(_token(key, exp_delta=-10))) is None             # expired
+    other = JsonWebKey.generate_key("RSA", 2048, {"kid": "k1"}, is_private=True)
+    assert asyncio.run(v.validate(_token(other, aud="api://whatever"))) is None    # bad signature
+
+
 def test_wrong_issuer_rejected(keys):
     key, jwks = keys
     assert asyncio.run(_validator(jwks).validate(_token(key, iss="https://evil/v2.0"))) is None

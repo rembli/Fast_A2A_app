@@ -41,9 +41,15 @@ class BearerValidator:
     """
 
     def __init__(self, discovery_url: str | None, audience: str, *,
-                 issuer: str | None = None, jwks: dict | None = None) -> None:
+                 issuer: str | None = None, jwks: dict | None = None,
+                 accept_any_audience: bool = False) -> None:
         self._discovery_url = discovery_url
         self._audience = audience
+        # When True the ``aud`` claim is NOT checked — signature, issuer and expiry
+        # still are. Used by the optional/open bearer mode to read a caller's
+        # profile from a token minted for any audience (e.g. a different app in the
+        # same tenant). Off by default: normal mode pins the audience.
+        self._accept_any_audience = accept_any_audience
         self._issuer = issuer
         self._jwks_uri: str | None = None
         self._keyset = JsonWebKey.import_key_set(jwks) if jwks else None
@@ -87,15 +93,15 @@ class BearerValidator:
         try:
             kid = _peek_kid(token)
             await self._ensure_keys(kid=kid)
-            claims = _JWT.decode(
-                token,
-                key=self._keyset,
-                claims_options={
-                    "iss": {"essential": True, "values": [self._issuer]} if self._issuer else {},
-                    "aud": {"essential": True, "value": self._audience},
-                    "exp": {"essential": True},
-                },
-            )
+            options = {
+                "iss": {"essential": True, "values": [self._issuer]} if self._issuer else {},
+                "exp": {"essential": True},
+            }
+            # Pin the audience unless this validator was asked to accept any (the
+            # open/optional mode, where the token is only a profile, not a grant).
+            if not self._accept_any_audience:
+                options["aud"] = {"essential": True, "value": self._audience}
+            claims = _JWT.decode(token, key=self._keyset, claims_options=options)
             claims.validate()  # exp/nbf/iat + the options above; raises on failure
             return dict(claims)
         except (JoseError, httpx.HTTPError, ValueError, KeyError) as exc:

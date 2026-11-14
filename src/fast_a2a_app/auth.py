@@ -142,6 +142,13 @@ class OIDCSettings:
     bearer_flow: str = "app"
     # The delegated scope name the agent exposes (used when bearer_flow="user").
     bearer_user_scope: str = "access_as_user"
+    # OPEN mode (intranet-only agents). When True the ``/a2a`` API never 401s for a
+    # missing/invalid bearer — anonymous callers are admitted. A bearer that IS
+    # presented is still decoded for the caller's profile (signature + issuer +
+    # expiry verified; ``aud`` NOT checked, so a token minted for any app in the
+    # tenant yields a profile). Use only where the network itself is the trust
+    # boundary. From A2A_BEARER_OPTIONAL / OIDC_BEARER_OPTIONAL.
+    bearer_optional: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -195,6 +202,9 @@ class OIDCSettings:
             bearer_flow=(os.environ.get("A2A_BEARER_FLOW")
                          or os.environ.get("OIDC_BEARER_FLOW") or "app").strip().lower() or "app",
             bearer_user_scope=(os.environ.get("A2A_BEARER_USER_SCOPE") or "access_as_user").strip(),
+            bearer_optional=(os.environ.get("A2A_BEARER_OPTIONAL")
+                             or os.environ.get("OIDC_BEARER_OPTIONAL")
+                             or "").strip().lower() in ("1", "true", "yes", "on"),
         )
 
 
@@ -419,6 +429,7 @@ class RequireAuthMiddleware:
         # discover which audience to mint a token for (see _challenge_headers).
         self._bearer_audience = settings.bearer_audience
         self._discovery_url = settings.discovery_url
+        self._bearer_optional = settings.bearer_optional
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -448,6 +459,12 @@ class RequireAuthMiddleware:
                                              "token": "bearer"})
                 await self.app(scope, receive, send)
                 return
+        # OPEN mode: the API is admitted without a verified bearer (intranet is the
+        # trust boundary). A valid bearer, if any, was already turned into a profile
+        # above; here the caller is simply anonymous.
+        if is_api and self._bearer_optional:
+            await self.app(scope, receive, send)
+            return
         if is_api:
             response: Response = Response(status_code=401, headers=self._challenge_headers())
         else:
@@ -552,15 +569,26 @@ def install_auth(
     # gate can read it.
     if gate_on:
         bearer = None
-        if settings.enabled and settings.bearer_audience:
+        # Build the validator when an audience is pinned, OR in open mode (where it
+        # reads a caller's profile from any token). Open mode only needs the
+        # discovery document to verify signatures/issuer.
+        if settings.enabled and (settings.bearer_audience
+                                 or (settings.bearer_optional and settings.discovery_url)):
             from ._bearer import BearerValidator
 
             bearer = BearerValidator(
                 settings.discovery_url,
-                settings.bearer_audience,
+                settings.bearer_audience or "",
                 issuer=settings.bearer_issuer,
+                accept_any_audience=settings.bearer_optional,
             )
-            log.info("install_auth: bearer-token acceptance ON (aud=%s)", settings.bearer_audience)
+            log.info(
+                "install_auth: bearer-token acceptance ON (aud=%s%s)",
+                settings.bearer_audience or "any",
+                ", OPEN/optional" if settings.bearer_optional else "",
+            )
+        if settings.bearer_optional:
+            log.info("install_auth: /a2a OPEN mode — API admits anonymous callers")
         app.add_middleware(RequireAuthMiddleware, settings=settings, bearer=bearer)
 
     # Sign session cookies. In the cluster the stable, replica-shared client
