@@ -182,6 +182,97 @@ class OIDCSettings:
         )
 
 
+# The settings resolved by the most recent :func:`install_auth` call. Lets
+# :func:`build_a2a_app` advertise the agent's OAuth2 requirement on the card
+# without the agent author having to thread the settings through by hand (the
+# common single-agent-per-process deployment). An explicit ``auth_settings=``
+# argument always wins over this.
+_INSTALLED_SETTINGS: "OIDCSettings | None" = None
+
+
+# Name the single OAuth2 security scheme is registered under on the agent card.
+_A2A_SECURITY_SCHEME_NAME = "entra"
+
+# Entra's v2.0 discovery URL, from which the authorize/token endpoints follow a
+# fixed layout: ``.../{tenant}/v2.0/.well-known/openid-configuration``.
+_ENTRA_DISCOVERY_SUFFIX = "/v2.0/.well-known/openid-configuration"
+
+
+def _entra_oauth_endpoints(discovery_url: "str | None") -> tuple[str, str]:
+    """Return ``(authorization_url, token_url)`` for an Entra discovery URL, or
+    ``("", "")`` when the URL isn't the recognisable Entra v2.0 layout (a
+    generic OIDC provider — the client reads the endpoints from the metadata
+    document instead)."""
+    if not discovery_url or not discovery_url.endswith(_ENTRA_DISCOVERY_SUFFIX):
+        return ("", "")
+    tenant_base = discovery_url[: -len(_ENTRA_DISCOVERY_SUFFIX)]  # .../{tenant}
+    return (
+        f"{tenant_base}/oauth2/v2.0/authorize",
+        f"{tenant_base}/oauth2/v2.0/token",
+    )
+
+
+def apply_agent_card_security(agent_card, settings: "OIDCSettings | None" = None):
+    """Advertise this agent's bearer requirement on its public AgentCard.
+
+    When a ``bearer_audience`` is configured the ``/a2a`` surface requires an
+    ``Authorization: Bearer`` token whose ``aud`` equals that audience. A caller
+    (another backend) otherwise has no way to learn *which* audience to mint a
+    token for except out of band. This stamps the card with a standard A2A
+    OAuth2 security scheme carrying the ready-to-use scope
+    (``<audience>/.default``) and the OIDC metadata URL, so a client that
+    resolves the card can acquire the right token with no pre-shared config.
+
+    No-ops (returns the card unchanged) when there is no bearer audience, or
+    when the author already declared security on the card — an explicit
+    declaration is always respected. Mutates and returns ``agent_card``.
+    """
+    settings = settings if settings is not None else _INSTALLED_SETTINGS
+    if settings is None or not settings.bearer_audience:
+        return agent_card
+    # Respect an author who declared their own security scheme.
+    if len(agent_card.security_schemes) > 0 or len(agent_card.security_requirements) > 0:
+        return agent_card
+
+    from a2a.types import (
+        AuthorizationCodeOAuthFlow,
+        OAuth2SecurityScheme,
+        OAuthFlows,
+        SecurityRequirement,
+        SecurityScheme,
+        StringList,
+    )
+
+    scope = f"{settings.bearer_audience}/.default"
+    agent_label = agent_card.name or "this agent"
+    # The authorize/token endpoints live in the OIDC metadata document
+    # (``oauth2_metadata_url``), which any client can read. We additionally fill
+    # them inline when they can be derived with certainty (Entra's well-known
+    # layout) so the card is A2A-spec-compliant (both are REQUIRED fields) and
+    # usable by clients that don't follow the metadata URL. For a non-Entra
+    # provider we leave them empty and rely on the metadata URL rather than
+    # guess an endpoint layout.
+    authorize_url, token_url = _entra_oauth_endpoints(settings.discovery_url)
+    scheme = SecurityScheme(
+        oauth2_security_scheme=OAuth2SecurityScheme(
+            description=f"Microsoft Entra ID OAuth2 bearer token required to call {agent_label}.",
+            flows=OAuthFlows(
+                authorization_code=AuthorizationCodeOAuthFlow(
+                    authorization_url=authorize_url,
+                    token_url=token_url,
+                    scopes={scope: f"Call {agent_label}"},
+                ),
+            ),
+            oauth2_metadata_url=settings.discovery_url or "",
+        )
+    )
+    agent_card.security_schemes[_A2A_SECURITY_SCHEME_NAME].CopyFrom(scheme)
+    agent_card.security_requirements.append(
+        SecurityRequirement(schemes={_A2A_SECURITY_SCHEME_NAME: StringList(list=[scope])})
+    )
+    return agent_card
+
+
 def _redirect_uri(request: Request, settings: OIDCSettings) -> str:
     """The OIDC callback URL — must match the URI registered on the provider.
 
@@ -210,8 +301,18 @@ def _normalise_user(claims: dict) -> dict:
     }
 
 
-def _build_router(oauth: OAuth, settings: OIDCSettings) -> APIRouter:
-    """Create the ``/auth/*`` + ``/api/me`` routes bound to this OIDC client."""
+def _build_router(oauth: OAuth, settings: OIDCSettings, on_login=None) -> APIRouter:
+    """Create the ``/auth/*`` + ``/api/me`` routes bound to this OIDC client.
+
+    ``on_login`` — optional ``async (request, token) -> None`` invoked right after
+    a successful sign-in with the full authlib token dict (``access_token``,
+    usually ``refresh_token``, ``expires_at``, ``userinfo``, ``id_token``). The
+    framework itself keeps only the user claims in the session; this hook lets an
+    app that needs the delegated tokens (e.g. to call a downstream API On-Behalf-Of
+    the user) persist them in its own store instead, without the tokens bloating
+    the signed session cookie. A hook failure fails the login (the app opted into
+    needing those tokens, so a silent drop would be worse).
+    """
     router = APIRouter()
     client = getattr(oauth, _CLIENT_NAME)
 
@@ -234,6 +335,10 @@ def _build_router(oauth: OAuth, settings: OIDCSettings) -> APIRouter:
         if not claims:
             raise HTTPException(401, "no id_token in provider response")
         request.session["user"] = _normalise_user(dict(claims))
+        if on_login is not None:
+            # Hand the app the full token set to persist (refresh token etc.).
+            # Runs before the session cookie is finalised on the redirect.
+            await on_login(request, dict(token))
         log.info("User signed in: %s", request.session["user"].get("email"))
         return RedirectResponse("/")
 
@@ -354,6 +459,7 @@ def install_auth(
     *,
     settings: OIDCSettings | None = None,
     require_login: bool | None = None,
+    on_login=None,
 ) -> OIDCSettings:
     """Wire the ``/auth`` routes, session cookie, and (when enabled) the gate.
 
@@ -367,6 +473,12 @@ def install_auth(
         require_login: force the login gate on/off. ``None`` (default) ties
             it to ``settings.enabled`` — gated in the cluster where
             credentials are injected, open locally where they aren't.
+        on_login: optional ``async (request, token) -> None`` called after a
+            successful sign-in with the full authlib token dict. Use it to
+            persist the delegated ``refresh_token`` in your own store when the
+            app needs to call a downstream API On-Behalf-Of the user (the
+            framework session keeps only the user claims). See
+            :func:`_build_router`.
 
     Returns the resolved :class:`OIDCSettings` so the caller can branch on
     ``settings.enabled`` (e.g. to pass :func:`auth_ui_kwargs` to the UI).
@@ -374,6 +486,10 @@ def install_auth(
     from starlette.middleware.sessions import SessionMiddleware
 
     settings = settings or OIDCSettings.from_env()
+    # Remember the resolved settings so build_a2a_app can stamp the agent card's
+    # OAuth2 requirement without the author passing them through explicitly.
+    global _INSTALLED_SETTINGS
+    _INSTALLED_SETTINGS = settings
     gate_on = settings.enabled if require_login is None else require_login
     log.info(
         "install_auth: OIDC %s, login gate %s",
@@ -390,7 +506,7 @@ def install_auth(
             server_metadata_url=settings.discovery_url,
             client_kwargs={"scope": settings.scopes},
         )
-        app.include_router(_build_router(oauth, settings))
+        app.include_router(_build_router(oauth, settings, on_login=on_login))
     else:
         # No provider configured: still mount the routes so the UI's Sign-in
         # link is wired. ``/auth/status`` answers ``{authenticated: false}``

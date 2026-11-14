@@ -1247,6 +1247,7 @@ def build_a2a_app(
     on_task_cancel: Callable[[str, str], Awaitable[None]] | None = None,
     on_task_recover: Callable[[str, A2ATaskStore], Awaitable[None]] | None = None,
     task_store: A2ATaskStore | None = None,
+    auth_settings: object | None = None,
     debug: bool = False,
 ):
     """Assemble a Starlette ASGI app handling all A2A JSON-RPC methods.
@@ -1337,6 +1338,16 @@ def build_a2a_app(
 
     Set ``debug=True`` to include exception details in agent failure messages.
     """
+    # Stamp the OAuth2 requirement on the card when a bearer audience is
+    # configured, so a remote caller can discover the scope to mint a token for
+    # (``auth_settings`` wins; otherwise the settings install_auth remembered).
+    # Operate on a copy — the author's own card object stays untouched.
+    from ..auth import apply_agent_card_security
+
+    enriched_card = type(agent_card)()
+    enriched_card.CopyFrom(agent_card)
+    agent_card = apply_agent_card_security(enriched_card, auth_settings)
+
     resolved_prompt_builder = prompt_builder or _make_default_prompt_builder(
         system_prompt=system_prompt,
         history_max_lines=history_max_lines,

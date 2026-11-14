@@ -93,7 +93,7 @@ from .server import (
     text_artifact,
 )
 from .ui import a2a_ui, build_a2a_ui
-from .auth import OIDCSettings, auth_ui_kwargs, install_auth
+from .auth import OIDCSettings, apply_agent_card_security, auth_ui_kwargs, install_auth
 
 __all__ = [
     # Server
@@ -136,6 +136,7 @@ __all__ = [
     # Auth (generic OIDC; Microsoft Entra ID by default)
     "install_auth",
     "auth_ui_kwargs",
+    "apply_agent_card_security",
     "OIDCSettings",
     # Meta
     "__version__",
