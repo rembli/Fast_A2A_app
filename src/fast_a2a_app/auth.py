@@ -129,6 +129,19 @@ class OIDCSettings:
     # expected issuer is read from the discovery metadata unless overridden.
     bearer_audience: str | None = None
     bearer_issuer: str | None = None
+    # How callers should obtain the bearer, advertised on the agent card so a
+    # client knows which Entra flow to use:
+    #   "app"  (default) — the caller is a backend acting as itself; it mints an
+    #                      application token for ``<audience>/.default`` via client
+    #                      credentials (or a workload identity).
+    #   "user" — the agent acts on behalf of the signed-in user; the caller needs
+    #            a DELEGATED token for ``<audience>/access_as_user`` (the agent
+    #            must Expose that scope). Advertised as an authorization_code flow.
+    # Set it to "user" only for agents that read the user's own data (e.g. a
+    # calendar/mail agent). From A2A_BEARER_FLOW / OIDC_BEARER_FLOW.
+    bearer_flow: str = "app"
+    # The delegated scope name the agent exposes (used when bearer_flow="user").
+    bearer_user_scope: str = "access_as_user"
 
     @property
     def enabled(self) -> bool:
@@ -179,6 +192,9 @@ class OIDCSettings:
                              or os.environ.get("OIDC_BEARER_AUDIENCE") or "").strip() or None,
             bearer_issuer=(os.environ.get("A2A_BEARER_ISSUER")
                            or os.environ.get("OIDC_BEARER_ISSUER") or "").strip() or None,
+            bearer_flow=(os.environ.get("A2A_BEARER_FLOW")
+                         or os.environ.get("OIDC_BEARER_FLOW") or "app").strip().lower() or "app",
+            bearer_user_scope=(os.environ.get("A2A_BEARER_USER_SCOPE") or "access_as_user").strip(),
         )
 
 
@@ -236,6 +252,7 @@ def apply_agent_card_security(agent_card, settings: "OIDCSettings | None" = None
 
     from a2a.types import (
         AuthorizationCodeOAuthFlow,
+        ClientCredentialsOAuthFlow,
         OAuth2SecurityScheme,
         OAuthFlows,
         SecurityRequirement,
@@ -243,26 +260,41 @@ def apply_agent_card_security(agent_card, settings: "OIDCSettings | None" = None
         StringList,
     )
 
-    scope = f"{settings.bearer_audience}/.default"
     agent_label = agent_card.name or "this agent"
     # The authorize/token endpoints live in the OIDC metadata document
     # (``oauth2_metadata_url``), which any client can read. We additionally fill
     # them inline when they can be derived with certainty (Entra's well-known
-    # layout) so the card is A2A-spec-compliant (both are REQUIRED fields) and
-    # usable by clients that don't follow the metadata URL. For a non-Entra
-    # provider we leave them empty and rely on the metadata URL rather than
-    # guess an endpoint layout.
+    # layout) so the card is A2A-spec-compliant and usable by clients that don't
+    # follow the metadata URL.
     authorize_url, token_url = _entra_oauth_endpoints(settings.discovery_url)
+
+    # Advertise the flow that matches how this agent should be called:
+    #   user → authorization_code with the delegated <audience>/access_as_user scope
+    #   app  → client_credentials with the <audience>/.default scope
+    # The caller reads the flow to decide between a delegated (per-user) token and
+    # an application token.
+    if settings.bearer_flow == "user":
+        scope = f"{settings.bearer_audience}/{settings.bearer_user_scope}"
+        flows = OAuthFlows(
+            authorization_code=AuthorizationCodeOAuthFlow(
+                authorization_url=authorize_url,
+                token_url=token_url,
+                scopes={scope: f"Act as the signed-in user when calling {agent_label}"},
+            ),
+        )
+    else:
+        scope = f"{settings.bearer_audience}/.default"
+        flows = OAuthFlows(
+            client_credentials=ClientCredentialsOAuthFlow(
+                token_url=token_url,
+                scopes={scope: f"Call {agent_label} as an application"},
+            ),
+        )
+
     scheme = SecurityScheme(
         oauth2_security_scheme=OAuth2SecurityScheme(
             description=f"Microsoft Entra ID OAuth2 bearer token required to call {agent_label}.",
-            flows=OAuthFlows(
-                authorization_code=AuthorizationCodeOAuthFlow(
-                    authorization_url=authorize_url,
-                    token_url=token_url,
-                    scopes={scope: f"Call {agent_label}"},
-                ),
-            ),
+            flows=flows,
             oauth2_metadata_url=settings.discovery_url or "",
         )
     )

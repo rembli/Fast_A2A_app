@@ -35,17 +35,30 @@ def _settings(**over):
 
 
 def test_advertises_scope_and_endpoints():
+    # Default flow is "app" → client_credentials with the .default scope.
     card = apply_agent_card_security(_card("Data Analysis Agent"), _settings())
     assert set(card.security_schemes.keys()) == {"entra"}
-    flow = card.security_schemes["entra"].oauth2_security_scheme.flows.authorization_code
+    flow = card.security_schemes["entra"].oauth2_security_scheme.flows.client_credentials
     scope = f"{_AUD}/.default"
     assert scope in flow.scopes
-    # Entra endpoints are derived from the discovery URL for spec-compliance.
-    assert flow.authorization_url.endswith("/oauth2/v2.0/authorize")
     assert flow.token_url.endswith("/oauth2/v2.0/token")
     assert card.security_schemes["entra"].oauth2_security_scheme.oauth2_metadata_url == _ENTRA_DISCOVERY
     # The requirement references the scheme + scope so a client knows what to request.
     assert len(card.security_requirements) == 1
+    assert list(card.security_requirements[0].schemes["entra"].list) == [scope]
+
+
+def test_user_flow_advertises_authorization_code_with_named_scope():
+    # bearer_flow="user" → delegated authorization_code flow with access_as_user.
+    card = apply_agent_card_security(_card("Status Agent"), _settings(bearer_flow="user"))
+    oauth2 = card.security_schemes["entra"].oauth2_security_scheme
+    flow = oauth2.flows.authorization_code
+    scope = f"{_AUD}/access_as_user"
+    assert scope in flow.scopes
+    assert flow.authorization_url.endswith("/oauth2/v2.0/authorize")
+    assert flow.token_url.endswith("/oauth2/v2.0/token")
+    # app flow is NOT advertised in user mode
+    assert not oauth2.flows.HasField("client_credentials")
     assert list(card.security_requirements[0].schemes["entra"].list) == [scope]
 
 
@@ -73,8 +86,7 @@ def test_idempotent():
 def test_generic_oidc_leaves_endpoints_empty_but_sets_metadata_url():
     disc = "https://accounts.example.com/.well-known/openid-configuration"
     card = apply_agent_card_security(_card(), _settings(discovery_url=disc))
-    flow = card.security_schemes["entra"].oauth2_security_scheme.flows.authorization_code
-    assert flow.authorization_url == ""
+    flow = card.security_schemes["entra"].oauth2_security_scheme.flows.client_credentials
     assert flow.token_url == ""
     assert card.security_schemes["entra"].oauth2_security_scheme.oauth2_metadata_url == disc
     assert f"{_AUD}/.default" in flow.scopes
