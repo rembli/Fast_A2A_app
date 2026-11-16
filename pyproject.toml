@@ -35,7 +35,15 @@ dependencies = [
     "azure-identity (>=1.25.3,<2.0.0)",
     "openai (>=2.36.0,<3.0.0)",
     "anthropic (>=0.40.0,<1.0.0)",
-    "pydantic-ai (>=1.93.0,<2.0.0)",
+    # NOTE: fast_a2a_app is framework-agnostic — it never imports ``pydantic_ai``
+    # in code (only docstrings mention it). The former ``pydantic-ai
+    # (>=1.93.0,<2.0.0)`` dependency has been DROPPED: as the *meta* package it
+    # dragged in the ``openai`` extra, whose >=2.55 releases require openai>=3 and
+    # therefore collided with this package's own openai (<3.0.0) pin — capping any
+    # consumer at pydantic-ai 2.54 and blocking the latest 2.x Harness. Each
+    # consumer app declares the pydantic-ai (or pydantic-ai-slim) it actually
+    # needs; this package has no business pinning it. (Consumers on 1.x are
+    # unaffected — they still declare their own pin.)
     "greenlet (>=3.5.0,<4.0.0)",
     "folium (>=0.20.0,<0.21.0)",
     "hatch (>=1.16.5,<2.0.0)",
